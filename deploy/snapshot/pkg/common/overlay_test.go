@@ -61,7 +61,7 @@ func TestBuildExclusions(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildExclusions(tc.settings)
+			got := BuildExclusions(tc.settings)
 			gotSet := make(map[string]bool, len(got))
 			for _, v := range got {
 				gotSet[v] = true

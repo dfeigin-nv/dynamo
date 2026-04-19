@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	criurpc "github.com/checkpoint-restore/go-criu/v8/rpc"
@@ -44,13 +45,28 @@ func Checkpoint(ctx context.Context, ctrd *containerd.Client, log logr.Logger, r
 	checkpointStart := time.Now()
 	log.Info("=== Starting checkpoint operation ===")
 
-	if req.CheckpointStorageType != "pvc" {
-		return fmt.Errorf("checkpoint storage type %q is not supported", req.CheckpointStorageType)
+	if req.CheckpointStorageType != "pvc" && req.CheckpointStorageType != "s3" {
+		return fmt.Errorf("checkpoint storage type %q is not supported (must be pvc or s3)", req.CheckpointStorageType)
 	}
 	if req.CheckpointLocation == "" {
 		return fmt.Errorf("checkpoint location is required")
 	}
 
+	// Phase 1: Inspect container state
+	state, err := inspectContainer(ctx, ctrd, log, req)
+	if err != nil {
+		return err
+	}
+
+	if req.CheckpointStorageType == "s3" {
+		if os.Getenv("S3_DIRECT") == "1" {
+			log.Info("Using S3 direct checkpoint path (S3_DIRECT=1)")
+			return checkpointS3Direct(ctx, log, req, cfg, state, checkpointStart)
+		}
+		return checkpointS3(ctx, log, req, cfg, state, checkpointStart)
+	}
+
+	// --- PVC path ---
 	finalDir := req.CheckpointLocation
 	tmpRoot := filepath.Join(filepath.Dir(finalDir), "tmp")
 	if err := os.MkdirAll(tmpRoot, 0700); err != nil {
@@ -61,12 +77,6 @@ func Checkpoint(ctx context.Context, ctrd *containerd.Client, log logr.Logger, r
 		return fmt.Errorf("failed to create checkpoint staging directory: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
-
-	// Phase 1: Inspect container state
-	state, err := inspectContainer(ctx, ctrd, log, req)
-	if err != nil {
-		return err
-	}
 
 	// Phase 2: Configure CRIU options and build checkpoint manifest
 	criuOpts, data, err := configureCheckpoint(log, state, req, cfg, tmpDir)
@@ -205,7 +215,7 @@ func configureCheckpoint(
 		req.CheckpointHash,
 		types.NewCRIUDumpManifest(criuOpts, cfg.CRIU),
 		types.NewSourcePodManifest(req.ContainerID, state.PID, req.NodeName, req.PodName, req.PodNamespace, state.StdioFDs),
-		types.NewOverlayManifest(cfg.Overlay, state.UpperDir, state.OCISpec),
+		types.NewOverlayManifest(cfg.Overlay, state.UpperDir, state.OCISpec, state.Mounts),
 	)
 	if len(state.CUDANSPIDs) > 0 {
 		m.CUDA = types.NewCUDAManifest(state.CUDANSPIDs, state.GPUUUIDs)
@@ -244,4 +254,100 @@ func captureCheckpoint(ctx context.Context, criuOpts *criurpc.CriuOpts, criuSett
 	}
 
 	return criuDumpDuration, nil
+}
+
+// checkpointS3 performs a streaming S3 checkpoint: CUDA lock/checkpoint first,
+// then criu.ExecuteDumpS3 which streams CRIU images + rootfs diff directly to S3.
+func checkpointS3(ctx context.Context, log logr.Logger, req CheckpointRequest,
+	cfg *types.AgentConfig, state *types.CheckpointContainerSnapshot, checkpointStart time.Time) error {
+
+	// CUDA lock+checkpoint must happen before CRIU dump
+	if len(state.CUDAHostPIDs) > 0 {
+		if err := cuda.LockAndCheckpointProcessTree(ctx, state.CUDAHostPIDs, log); err != nil {
+			return fmt.Errorf("CUDA checkpoint failed: %w", err)
+		}
+	}
+
+	// Build CRIU opts (no local checkpointDir — pass empty string, criu.conf is written to socket dir)
+	criuOpts, manifest, err := configureCheckpointNoDir(log, state, req, cfg)
+	if err != nil {
+		return err
+	}
+
+	// CheckpointLocation includes the hash (e.g. s3://bucket/prefix/HASH).
+	// ExecuteDumpS3 expects the prefix WITHOUT hash — strip it.
+	s3Prefix := strings.TrimSuffix(req.CheckpointLocation, "/"+req.CheckpointHash)
+
+	// Stream directly to S3 (no local tmpDir for CRIU images)
+	criuDumpDuration, err := criu.ExecuteDumpS3(criuOpts, &cfg.CRIU, manifest,
+		state.UpperDir, s3Prefix, req.CheckpointHash, 0, log)
+	if err != nil {
+		return fmt.Errorf("S3 streaming checkpoint failed: %w", err)
+	}
+
+	totalDuration := time.Since(checkpointStart)
+	log.Info("=== S3 checkpoint operation completed ===",
+		"total_duration", totalDuration,
+		"criu_dump_duration", criuDumpDuration,
+	)
+	return nil
+}
+
+// checkpointS3Direct dumps to a tmpfs directory, then uploads individual files to S3.
+// No streamer involved — s5cmd handles the upload.
+func checkpointS3Direct(ctx context.Context, log logr.Logger, req CheckpointRequest,
+	cfg *types.AgentConfig, state *types.CheckpointContainerSnapshot, checkpointStart time.Time) error {
+
+	// CUDA lock+checkpoint before CRIU dump
+	if len(state.CUDAHostPIDs) > 0 {
+		if err := cuda.LockAndCheckpointProcessTree(ctx, state.CUDAHostPIDs, log); err != nil {
+			return fmt.Errorf("CUDA checkpoint failed: %w", err)
+		}
+	}
+
+	criuOpts, manifest, err := configureCheckpointNoDir(log, state, req, cfg)
+	if err != nil {
+		return err
+	}
+
+	s3Prefix := strings.TrimSuffix(req.CheckpointLocation, "/"+req.CheckpointHash)
+
+	criuDumpDuration, err := criu.ExecuteDumpS3Direct(criuOpts, &cfg.CRIU, manifest,
+		state.UpperDir, s3Prefix, req.CheckpointHash, log)
+	if err != nil {
+		return fmt.Errorf("S3 direct checkpoint failed: %w", err)
+	}
+
+	totalDuration := time.Since(checkpointStart)
+	log.Info("=== S3 direct checkpoint completed ===",
+		"total_duration", totalDuration,
+		"criu_dump_duration", criuDumpDuration,
+	)
+	return nil
+}
+
+// configureCheckpointNoDir configures checkpoint options without a local checkpoint directory.
+// Returns criuOpts (no criu.conf yet) and manifest for S3 streaming checkpoint.
+// ExecuteDumpS3 writes the criu.conf to its own socket dir and sets ConfigFile.
+func configureCheckpointNoDir(log logr.Logger, state *types.CheckpointContainerSnapshot,
+	req CheckpointRequest, cfg *types.AgentConfig) (*criurpc.CriuOpts, *types.CheckpointManifest, error) {
+
+	// Build CRIU opts — no criu.conf written here (ExecuteDumpS3 handles it)
+	criuOpts, err := criu.BuildDumpOptionsNoConf(state, &cfg.CRIU, log)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	m := types.NewCheckpointManifest(
+		req.CheckpointHash,
+		types.NewCRIUDumpManifest(criuOpts, cfg.CRIU),
+		types.NewSourcePodManifest(req.ContainerID, state.PID, req.NodeName, req.PodName, req.PodNamespace, state.StdioFDs),
+		types.NewOverlayManifest(cfg.Overlay, state.UpperDir, state.OCISpec, state.Mounts),
+	)
+	if len(state.CUDANSPIDs) > 0 {
+		m.CUDA = types.NewCUDAManifest(state.CUDANSPIDs, state.GPUUUIDs)
+	}
+	// Note: manifest is NOT written to disk — ExecuteDumpS3 embeds it in the stream
+
+	return criuOpts, m, nil
 }

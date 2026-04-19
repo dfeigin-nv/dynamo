@@ -204,7 +204,8 @@ func (w *NodeController) reconcileCheckpointPod(ctx context.Context, pod *corev1
 
 	job, err := getCheckpointJob(ctx, w.clientset, pod)
 	if err != nil {
-		w.log.Error(err, "Failed to resolve checkpoint job", "pod", podKey)
+		// Job may have been deleted after checkpoint completed — log at debug, not error.
+		w.log.V(1).Info("Could not resolve checkpoint job, skipping reconcile", "pod", podKey, "error", err)
 		return
 	}
 
@@ -278,9 +279,13 @@ func (w *NodeController) reconcileRestorePod(ctx context.Context, pod *corev1.Po
 		w.log.Error(err, "Restore pod is missing storage metadata", "pod", podKey, "checkpoint_hash", checkpointHash)
 		return
 	}
-	if _, err := os.Stat(checkpointLocation); os.IsNotExist(err) {
-		w.log.V(1).Info("Checkpoint not ready on disk, skipping restore", "pod", podKey, "checkpoint_hash", checkpointHash, "checkpoint_location", checkpointLocation)
-		return
+	// For pvc storage: check checkpoint directory exists on disk.
+	// For s3 storage: the agent will attempt to stream from S3; skip the local stat check.
+	if checkpointStorageType == "pvc" {
+		if _, err := os.Stat(checkpointLocation); os.IsNotExist(err) {
+			w.log.V(1).Info("Checkpoint not ready on disk, skipping restore", "pod", podKey, "checkpoint_hash", checkpointHash, "checkpoint_location", checkpointLocation)
+			return
+		}
 	}
 
 	containerName := resolveMainContainerName(pod)
@@ -432,22 +437,27 @@ func (w *NodeController) runCheckpoint(ctx context.Context, pod *corev1.Pod, job
 		return nil
 	}
 
-	info, err := os.Stat(checkpointLocation)
-	if err != nil || !info.IsDir() {
-		if err == nil {
-			err = fmt.Errorf("published checkpoint path %s is not a directory", checkpointLocation)
-		} else {
-			err = fmt.Errorf("published checkpoint path %s is missing: %w", checkpointLocation, err)
+	// For pvc storage: verify the checkpoint directory exists on disk.
+	// For s3 storage: the executor streams directly to S3; no local directory to verify.
+	if checkpointStorageType == "pvc" {
+		info, statErr := os.Stat(checkpointLocation)
+		if statErr != nil || !info.IsDir() {
+			var verifyErr error
+			if statErr == nil {
+				verifyErr = fmt.Errorf("published checkpoint path %s is not a directory", checkpointLocation)
+			} else {
+				verifyErr = fmt.Errorf("published checkpoint path %s is missing: %w", checkpointLocation, statErr)
+			}
+			log.Error(verifyErr, "Checkpoint failed verification")
+			emitPodEvent(ctx, w.clientset, log, pod, "snapshot", corev1.EventTypeWarning, "CheckpointFailed", verifyErr.Error())
+			if signalErr := common.SendSignalToPID(log, containerPID, syscall.SIGKILL, "checkpoint verification failed"); signalErr != nil {
+				log.Error(signalErr, "Failed to signal checkpoint verification failure to runtime process")
+			}
+			if statusErr := setCheckpointStatus("failed"); statusErr != nil {
+				return statusErr
+			}
+			return nil
 		}
-		log.Error(err, "Checkpoint failed verification")
-		emitPodEvent(ctx, w.clientset, log, pod, "snapshot", corev1.EventTypeWarning, "CheckpointFailed", err.Error())
-		if signalErr := common.SendSignalToPID(log, containerPID, syscall.SIGKILL, "checkpoint verification failed"); signalErr != nil {
-			log.Error(signalErr, "Failed to signal checkpoint verification failure to runtime process")
-		}
-		if statusErr := setCheckpointStatus("failed"); statusErr != nil {
-			return statusErr
-		}
-		return nil
 	}
 
 	// Step 2: SIGUSR1 on success: notify the workload that checkpoint completed
@@ -599,8 +609,8 @@ func checkpointStorageFromPod(pod *corev1.Pod) (string, string, error) {
 	if checkpointStorageType == "" {
 		return "", "", fmt.Errorf("missing %s annotation", kubeAnnotationCheckpointStorageType)
 	}
-	if checkpointStorageType != "pvc" {
-		return "", "", fmt.Errorf("checkpoint storage type %q is not supported", checkpointStorageType)
+	if checkpointStorageType != "pvc" && checkpointStorageType != "s3" {
+		return "", "", fmt.Errorf("checkpoint storage type %q is not supported (must be pvc or s3)", checkpointStorageType)
 	}
 
 	return checkpointLocation, checkpointStorageType, nil

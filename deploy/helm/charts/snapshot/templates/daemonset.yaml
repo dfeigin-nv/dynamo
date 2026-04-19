@@ -97,6 +97,8 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             {{- end }}
+            - name: S3_SHARD_LZ4
+              value: {{ if .Values.storage.s3.shardLZ4 }}"1"{{ else }}"0"{{ end }}
           volumeMounts:
             # Mount configuration ConfigMap
             - name: config

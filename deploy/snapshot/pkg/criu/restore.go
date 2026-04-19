@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	criulib "github.com/checkpoint-restore/go-criu/v8"
 	criurpc "github.com/checkpoint-restore/go-criu/v8/rpc"
@@ -72,11 +73,14 @@ func ExecuteRestore(
 
 	notify := &restoreNotify{log: log}
 	log.Info("Executing go-criu Restore call")
+	restoreStart := time.Now()
 	if err := c.Restore(criuOpts, notify); err != nil {
 		log.Error(err, "go-criu Restore returned error")
 		logging.LogRestoreErrors(checkpointPath, settings.WorkDir, log)
 		return 0, fmt.Errorf("CRIU restore failed: %w", err)
 	}
+	restoreDuration := time.Since(restoreStart)
+	log.Info("CRIU restore completed", "duration", restoreDuration, "restored_pid", notify.restoredPID)
 
 	return notify.restoredPID, nil
 }
@@ -105,6 +109,7 @@ func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroup
 	criuOpts.MntnsCompatMode = proto.Bool(settings.MntnsCompatMode)
 	criuOpts.EvasiveDevices = proto.Bool(settings.EvasiveDevices)
 	criuOpts.ForceIrmap = proto.Bool(settings.ForceIrmap)
+	criuOpts.DisplayStats = proto.Bool(true)
 
 	if cgroupRoot != "" && shouldSetCgroupRoot(criuOpts.GetManageCgroupsMode()) {
 		criuOpts.CgRoot = []*criurpc.CgroupRoot{
@@ -175,17 +180,25 @@ func closeFiles(files []*os.File) {
 
 type restoreNotify struct {
 	criulib.NoNotify
-	restoredPID int32
-	log         logr.Logger
+	restoredPID   int32
+	log           logr.Logger
+	preRestoreAt  time.Time
+	postRestoreAt time.Time
 }
 
 func (n *restoreNotify) PreRestore() error {
-	n.log.V(1).Info("CRIU pre-restore")
+	n.preRestoreAt = time.Now()
+	n.log.Info("[TIMING] CRIU notification: PreRestore")
 	return nil
 }
 
 func (n *restoreNotify) PostRestore(pid int32) error {
+	n.postRestoreAt = time.Now()
 	n.restoredPID = pid
-	n.log.Info("CRIU post-restore: process restored", "pid", pid)
+	if !n.preRestoreAt.IsZero() {
+		n.log.Info("[TIMING] CRIU notification: PostRestore", "pid", pid, "duration_since_prerestore", n.postRestoreAt.Sub(n.preRestoreAt))
+	} else {
+		n.log.Info("CRIU post-restore: process restored", "pid", pid)
+	}
 	return nil
 }

@@ -42,7 +42,13 @@ storage:
   s3:
     # S3 URI (e.g., s3://my-bucket/checkpoints)
     uri: ""
-    # Credentials are expected via IRSA or mounted secrets
+    # Reference to a secret containing AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION.
+    # Leave empty to use IRSA / Workload Identity.
+    credentialsSecretRef: ""
+    # Number of parallel shards for criu-image-streamer S3 upload/download.
+    numShards: 16
+    # Enable lz4 compression on shard upload/download. Set to false to test raw throughput.
+    shardLZ4: true
 
   # OCI configuration (when type=oci)
   oci:
@@ -132,7 +138,12 @@ config:
       - /sys
       - /dev
       - "*/.cache/huggingface"
+      - "/.cache/huggingface"
       - "*/.cache/vllm/torch_compile_cache"
+      - "/root/.cache/vllm"             # torch_compile_cache and other vllm caches (not mmap'd, safe to exclude)
+      - "/workspace"                    # safety net: model weights leaked into overlay
+      # NOTE: /tmp/torchinductor_root is NOT excluded — triton .so files there are
+      # mmap'd by the process and CRIU needs them present on restore.
       - "*/__pycache__"
       - "*.pyc"
 

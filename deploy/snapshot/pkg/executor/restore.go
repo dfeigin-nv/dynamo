@@ -75,29 +75,43 @@ func Restore(ctx context.Context, ctrd *containerd.Client, log logr.Logger, req 
 }
 
 func inspectRestore(ctx context.Context, ctrd *containerd.Client, log logr.Logger, req RestoreRequest) (*types.RestoreContainerSnapshot, error) {
-	if req.CheckpointStorageType != "pvc" {
-		return nil, fmt.Errorf("checkpoint storage type %q is not supported", req.CheckpointStorageType)
+	if req.CheckpointStorageType != "pvc" && req.CheckpointStorageType != "s3" {
+		return nil, fmt.Errorf("checkpoint storage type %q is not supported (must be pvc or s3)", req.CheckpointStorageType)
 	}
 	if req.CheckpointLocation == "" {
 		return nil, fmt.Errorf("checkpoint location is required")
 	}
 
-	checkpointPath := req.CheckpointLocation
-	baseAbs, err := filepath.Abs(filepath.Dir(checkpointPath))
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve checkpoint base path: %w", err)
-	}
-	checkpointAbs, err := filepath.Abs(checkpointPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve checkpoint path: %w", err)
-	}
-	if checkpointAbs != baseAbs && !strings.HasPrefix(checkpointAbs, baseAbs+string(os.PathSeparator)) {
-		return nil, fmt.Errorf("invalid checkpoint hash %q", req.CheckpointHash)
-	}
+	var m *types.CheckpointManifest
+	var checkpointPath string
 
-	m, err := types.ReadManifest(checkpointPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint manifest: %w", err)
+	if req.CheckpointStorageType == "s3" {
+		// CheckpointLocation includes the hash — strip it to get the prefix.
+		s3Prefix := strings.TrimSuffix(req.CheckpointLocation, "/"+req.CheckpointHash)
+		var err error
+		m, err = criu.DownloadManifestS3(s3Prefix, req.CheckpointHash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download S3 manifest: %w", err)
+		}
+		checkpointPath = "" // not used for S3 (nsrestore uses --checkpoint-location + --checkpoint-hash)
+	} else {
+		// PVC: read manifest from local checkpoint directory
+		checkpointPath = req.CheckpointLocation
+		baseAbs, err := filepath.Abs(filepath.Dir(checkpointPath))
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve checkpoint base path: %w", err)
+		}
+		checkpointAbs, err := filepath.Abs(checkpointPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve checkpoint path: %w", err)
+		}
+		if checkpointAbs != baseAbs && !strings.HasPrefix(checkpointAbs, baseAbs+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("invalid checkpoint hash %q", req.CheckpointHash)
+		}
+		m, err = types.ReadManifest(checkpointPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read checkpoint manifest: %w", err)
+		}
 	}
 
 	containerName := req.ContainerName
@@ -149,11 +163,14 @@ func inspectRestore(ctx context.Context, ctrd *containerd.Client, log logr.Logge
 	}
 
 	return &types.RestoreContainerSnapshot{
-		CheckpointPath: checkpointPath,
-		PlaceholderPID: placeholderPID,
-		TargetRoot:     fmt.Sprintf("%s/%d/root", common.HostProcPath, placeholderPID),
-		CgroupRoot:     cgroupRoot,
-		CUDADeviceMap:  cudaDeviceMap,
+		CheckpointPath:        checkpointPath,
+		CheckpointStorageType: req.CheckpointStorageType,
+		CheckpointLocation:    req.CheckpointLocation,
+		CheckpointHash:        req.CheckpointHash,
+		PlaceholderPID:        placeholderPID,
+		TargetRoot:            fmt.Sprintf("%s/%d/root", common.HostProcPath, placeholderPID),
+		CgroupRoot:            cgroupRoot,
+		CUDADeviceMap:         cudaDeviceMap,
 	}, nil
 }
 
@@ -162,12 +179,20 @@ func inspectRestore(ctx context.Context, ctrd *containerd.Client, log logr.Logge
 func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, snap *types.RestoreContainerSnapshot) (int, error) {
 	args := []string{
 		"-t", strconv.Itoa(snap.PlaceholderPID),
-		// Intentionally exclude cgroup namespace (-C): CRIU must manage cgroups
-		// from the host-visible hierarchy so --cgroup-root remap works.
 		"-m", "-u", "-i", "-n", "-p",
 		"--", req.NSRestorePath,
-		"--checkpoint-path", snap.CheckpointPath,
 	}
+
+	if snap.CheckpointStorageType == "s3" {
+		args = append(args,
+			"--checkpoint-storage-type", "s3",
+			"--checkpoint-location", snap.CheckpointLocation,
+			"--checkpoint-hash", snap.CheckpointHash,
+		)
+	} else {
+		args = append(args, "--checkpoint-path", snap.CheckpointPath)
+	}
+
 	if snap.CUDADeviceMap != "" {
 		args = append(args, "--cuda-device-map", snap.CUDADeviceMap)
 	}

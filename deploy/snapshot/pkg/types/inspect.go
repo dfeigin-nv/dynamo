@@ -32,9 +32,12 @@ type CheckpointContainerSnapshot struct {
 
 // RestoreContainerSnapshot holds inspected state for the restore target.
 type RestoreContainerSnapshot struct {
-	CheckpointPath string
-	PlaceholderPID int
-	TargetRoot     string
-	CgroupRoot     string
-	CUDADeviceMap  string
+	CheckpointPath        string
+	CheckpointStorageType string // "pvc" or "s3"
+	CheckpointLocation    string // for s3: S3 URI prefix
+	CheckpointHash        string // for s3: checkpoint hash
+	PlaceholderPID        int
+	TargetRoot            string
+	CgroupRoot            string
+	CUDADeviceMap         string
 }

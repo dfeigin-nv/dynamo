@@ -58,7 +58,7 @@ func CaptureRootfsDiff(upperDir, checkpointDir string, exclusions types.OverlayS
 	rootfsDiffPath := filepath.Join(checkpointDir, rootfsDiffFilename)
 
 	tarArgs := []string{"--xattrs"}
-	for _, excl := range buildExclusions(exclusions) {
+	for _, excl := range BuildExclusions(exclusions) {
 		tarArgs = append(tarArgs, "--exclude="+excl)
 	}
 	for _, dest := range bindMountDests {
@@ -75,8 +75,8 @@ func CaptureRootfsDiff(upperDir, checkpointDir string, exclusions types.OverlayS
 	return rootfsDiffPath, nil
 }
 
-// buildExclusions merges exclusion lists and normalizes paths for tar --exclude patterns.
-func buildExclusions(s types.OverlaySettings) []string {
+// BuildExclusions merges exclusion lists and normalizes paths for tar --exclude patterns.
+func BuildExclusions(s types.OverlaySettings) []string {
 	exclusions := append([]string(nil), s.Exclusions...)
 	for i, p := range exclusions {
 		if strings.HasPrefix(p, "*") {
@@ -213,4 +213,61 @@ func findWhiteoutFiles(upperDir string) ([]string, error) {
 	})
 
 	return whiteouts, err
+}
+
+// CollectWhiteoutsJSON collects overlay whiteout (deleted) files and returns
+// them as a JSON-encoded byte slice. Returns nil if there are no whiteouts.
+// Used by S3 streaming checkpoint to embed deleted-files.json in the stream.
+func CollectWhiteoutsJSON(upperDir string) ([]byte, error) {
+	whiteouts, err := findWhiteoutFiles(upperDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find whiteout files: %w", err)
+	}
+	if len(whiteouts) == 0 {
+		return nil, nil
+	}
+	data, err := json.Marshal(whiteouts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal whiteouts: %w", err)
+	}
+	return data, nil
+}
+
+// ApplyDeletedFilesFromBytes removes files listed in a JSON byte slice from targetRoot.
+// Used by S3 streaming restore to apply deleted-files.json read from the stream.
+func ApplyDeletedFilesFromBytes(data []byte, targetRoot string, log logr.Logger) error {
+	if len(data) == 0 {
+		return nil
+	}
+	var deletedFiles []string
+	if err := json.Unmarshal(data, &deletedFiles); err != nil {
+		return fmt.Errorf("failed to parse deleted files: %w", err)
+	}
+
+	targetRootAbs, err := filepath.Abs(targetRoot)
+	if err != nil {
+		return fmt.Errorf("failed to resolve target root: %w", err)
+	}
+	targetRootPrefix := targetRootAbs + string(os.PathSeparator)
+
+	count := 0
+	for _, f := range deletedFiles {
+		if f == "" {
+			continue
+		}
+		target := filepath.Join(targetRoot, f)
+		targetAbs, err := filepath.Abs(target)
+		if err != nil || (targetAbs != targetRootAbs && !strings.HasPrefix(targetAbs, targetRootPrefix)) {
+			log.V(1).Info("Skipping out-of-root deleted file entry", "entry", f)
+			continue
+		}
+		if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+			log.V(1).Info("Failed to remove deleted file", "path", target, "error", err)
+			continue
+		}
+		count++
+	}
+
+	log.Info("Deleted files applied (from stream)", "count", count)
+	return nil
 }

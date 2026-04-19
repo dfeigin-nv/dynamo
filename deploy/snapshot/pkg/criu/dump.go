@@ -86,6 +86,60 @@ func BuildDumpOptions(
 	return criuOpts, nil
 }
 
+// BuildDumpOptionsNoConf builds CriuOpts like BuildDumpOptions but does NOT write
+// criu.conf or set ConfigFile. Used for S3 streaming where ExecuteDumpS3 writes
+// the conf to the streamer socket dir.
+func BuildDumpOptionsNoConf(
+	state *types.CheckpointContainerSnapshot,
+	settings *types.CRIUSettings,
+	log logr.Logger,
+) (*criurpc.CriuOpts, error) {
+	var maskedPaths []string
+	if state.OCISpec != nil && state.OCISpec.Linux != nil {
+		maskedPaths = state.OCISpec.Linux.MaskedPaths
+	}
+
+	externalized, skipped := common.BuildMountPolicy(state.Mounts, state.RootFS, maskedPaths)
+	log.V(1).Info("Resolved mount policy for CRIU dump",
+		"externalized_count", len(externalized),
+		"skipped_count", len(skipped),
+	)
+
+	criuOpts := &criurpc.CriuOpts{
+		Pid:      proto.Int32(int32(state.PID)),
+		Root:     proto.String(state.RootFS),
+		LogFile:  proto.String(dumpLogFilename),
+		External: []string{fmt.Sprintf("net[%d]:extNetNs", state.NetNSInode)},
+	}
+	criuOpts.ExtMnt = toExtMountMaps(externalized)
+	criuOpts.SkipMnt = skipped
+
+	if state.HostCgroupPath != "" {
+		criuOpts.FreezeCgroup = proto.String(state.HostCgroupPath)
+	}
+
+	if settings == nil {
+		return criuOpts, nil
+	}
+
+	if err := applyCommonSettings(criuOpts, settings); err != nil {
+		return nil, err
+	}
+
+	criuOpts.LeaveRunning = proto.Bool(settings.LeaveRunning)
+	criuOpts.OrphanPtsMaster = proto.Bool(settings.OrphanPtsMaster)
+	criuOpts.ExtMasters = proto.Bool(settings.ExtMasters)
+	criuOpts.AutoDedup = proto.Bool(settings.AutoDedup)
+	criuOpts.LazyPages = proto.Bool(settings.LazyPages)
+
+	if settings.GhostLimit > 0 {
+		criuOpts.GhostLimit = proto.Uint32(settings.GhostLimit)
+	}
+
+	// criu.conf is NOT written here — caller (ExecuteDumpS3) writes it to socket dir
+	return criuOpts, nil
+}
+
 // ExecuteDump opens the image directory FD, runs the CRIU dump, and cleans up.
 func ExecuteDump(
 	criuOpts *criurpc.CriuOpts,
