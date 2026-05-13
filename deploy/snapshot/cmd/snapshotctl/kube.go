@@ -82,6 +82,36 @@ func discoverSnapshotStorage(ctx context.Context, clientset kubernetes.Interface
 	return snapshotprotocol.DiscoverStorageFromDaemonSets(namespace, daemonSets.Items)
 }
 
+// selectStorage chooses the snapshot storage backend for a snapshotctl
+// invocation. Explicit --storage-type / --s3-uri flags override whatever
+// DiscoverStorageFromDaemonSets returned. If neither flag is set, the
+// discovered PVC layout is used as-is.
+func selectStorage(storageTypeFlag, s3URIFlag string, discovered snapshotprotocol.Storage) (snapshotprotocol.Storage, error) {
+	storageType := strings.ToLower(strings.TrimSpace(storageTypeFlag))
+	if storageType == "" {
+		storageType = discovered.Type
+	}
+	switch storageType {
+	case "", snapshotprotocol.StorageTypePVC:
+		return snapshotprotocol.Storage{
+			Type:     snapshotprotocol.StorageTypePVC,
+			PVCName:  discovered.PVCName,
+			BasePath: discovered.BasePath,
+		}, nil
+	case snapshotprotocol.StorageTypeS3:
+		s3URI := strings.TrimSpace(s3URIFlag)
+		if s3URI == "" {
+			return snapshotprotocol.Storage{}, fmt.Errorf("--s3-uri is required when --storage-type=s3")
+		}
+		return snapshotprotocol.Storage{
+			Type:  snapshotprotocol.StorageTypeS3,
+			S3URI: s3URI,
+		}, nil
+	default:
+		return snapshotprotocol.Storage{}, fmt.Errorf("unsupported --storage-type %q (expected pvc or s3)", storageType)
+	}
+}
+
 func loadPod(manifestPath string) (*corev1.Pod, error) {
 	content, err := os.ReadFile(manifestPath)
 	if err != nil {

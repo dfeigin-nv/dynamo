@@ -36,11 +36,13 @@ const (
 
 	CheckpointStorageTypeAnnotation     = "nvidia.com/snapshot-storage-type"
 	CheckpointStorageBasePathAnnotation = "nvidia.com/snapshot-storage-base-path"
+	CheckpointStorageS3URIAnnotation    = "nvidia.com/snapshot-storage-s3-uri"
 	CheckpointVolumeName                = "checkpoint-storage"
 	DefaultCheckpointArtifactVersion    = "1"
 	DefaultCheckpointJobTTLSeconds      = int32(300)
 	DefaultSeccompLocalhostProfile      = "profiles/block-iouring.json"
 	StorageTypePVC                      = "pvc"
+	StorageTypeS3                       = "s3"
 
 	CheckpointStatusCompleted = "completed"
 	CheckpointStatusFailed    = "failed"
@@ -54,6 +56,10 @@ type Storage struct {
 	Location string
 	PVCName  string
 	BasePath string
+
+	// S3URI is the s3://bucket/prefix root for S3 storage. The per-checkpoint
+	// shard prefix is derived by appending the checkpoint ID at resolve time.
+	S3URI string
 }
 
 type RestoreStatusAnnotationKeys struct {
@@ -73,6 +79,11 @@ func ResolveCheckpointStorage(checkpointID string, version string, storage Stora
 	resolved, err := resolveStorageConfig(storage)
 	if err != nil {
 		return Storage{}, err
+	}
+	if resolved.Type == StorageTypeS3 {
+		// S3 layout: <s3URI>/<checkpointID>/versions/<artifactVersion>
+		resolved.Location = strings.TrimRight(resolved.S3URI, "/") + "/" + checkpointID + "/versions/" + ArtifactVersion(version)
+		return resolved, nil
 	}
 	resolved.Location = strings.TrimRight(resolved.BasePath, "/") + "/" + checkpointID + "/versions/" + ArtifactVersion(version)
 	return resolved, nil
@@ -208,6 +219,7 @@ func ApplyCheckpointStorageMetadata(annotations map[string]string, storage Stora
 	}
 	delete(annotations, CheckpointStorageTypeAnnotation)
 	delete(annotations, CheckpointStorageBasePathAnnotation)
+	delete(annotations, CheckpointStorageS3URIAnnotation)
 	storageType := strings.TrimSpace(storage.Type)
 	if storageType != "" {
 		annotations[CheckpointStorageTypeAnnotation] = storageType
@@ -219,6 +231,10 @@ func ApplyCheckpointStorageMetadata(annotations map[string]string, storage Stora
 			basePath = "/"
 		}
 		annotations[CheckpointStorageBasePathAnnotation] = basePath
+	}
+	s3URI := strings.TrimSpace(storage.S3URI)
+	if s3URI != "" {
+		annotations[CheckpointStorageS3URIAnnotation] = strings.TrimRight(s3URI, "/")
 	}
 }
 
@@ -239,23 +255,37 @@ func resolveStorageConfig(storage Storage) (Storage, error) {
 	if storageType == "" {
 		storageType = StorageTypePVC
 	}
-	if storageType != StorageTypePVC {
+	switch storageType {
+	case StorageTypePVC:
+		basePath := strings.TrimSpace(storage.BasePath)
+		if basePath == "" {
+			return Storage{}, fmt.Errorf("checkpoint base path is required")
+		}
+		if !strings.HasPrefix(basePath, "/") {
+			return Storage{}, fmt.Errorf("checkpoint base path %q must be absolute", basePath)
+		}
+		basePath = strings.TrimRight(basePath, "/")
+		if basePath == "" {
+			basePath = "/"
+		}
+		return Storage{
+			Type:     storageType,
+			PVCName:  strings.TrimSpace(storage.PVCName),
+			BasePath: basePath,
+		}, nil
+	case StorageTypeS3:
+		s3URI := strings.TrimSpace(storage.S3URI)
+		if s3URI == "" {
+			return Storage{}, fmt.Errorf("storage.s3.uri is required when storage type is s3")
+		}
+		if !strings.HasPrefix(s3URI, "s3://") {
+			return Storage{}, fmt.Errorf("storage.s3.uri %q must begin with s3://", s3URI)
+		}
+		return Storage{
+			Type:  storageType,
+			S3URI: strings.TrimRight(s3URI, "/"),
+		}, nil
+	default:
 		return Storage{}, fmt.Errorf("checkpoint storage type %q is not supported", storageType)
 	}
-	basePath := strings.TrimSpace(storage.BasePath)
-	if basePath == "" {
-		return Storage{}, fmt.Errorf("checkpoint base path is required")
-	}
-	if !strings.HasPrefix(basePath, "/") {
-		return Storage{}, fmt.Errorf("checkpoint base path %q must be absolute", basePath)
-	}
-	basePath = strings.TrimRight(basePath, "/")
-	if basePath == "" {
-		basePath = "/"
-	}
-	return Storage{
-		Type:     storageType,
-		PVCName:  strings.TrimSpace(storage.PVCName),
-		BasePath: basePath,
-	}, nil
 }

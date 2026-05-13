@@ -27,7 +27,12 @@ type checkpointOptions struct {
 	CheckpointID                 string
 	Container                    string
 	DisableCudaCheckpointJobFile bool
-	Timeout                      time.Duration
+	// StorageType is "pvc" (default), "s3", or "" to fall back to whatever the
+	// snapshot-agent DaemonSet advertises in its mounted PVC volume.
+	StorageType string
+	// S3URI is the s3://bucket/prefix root used when StorageType=="s3".
+	S3URI   string
+	Timeout time.Duration
 }
 
 type result struct {
@@ -57,11 +62,11 @@ func runCheckpointFlow(ctx context.Context, opts checkpointOptions) (*result, er
 	if checkpointID == "" {
 		checkpointID = fmt.Sprintf("%s-%d", defaultGeneratedCheckpointIDPrefix, time.Now().UTC().UnixNano())
 	}
-	resolvedStorage, err := snapshotprotocol.ResolveCheckpointStorage(checkpointID, "", snapshotprotocol.Storage{
-		Type:     snapshotprotocol.StorageTypePVC,
-		PVCName:  storage.PVCName,
-		BasePath: storage.BasePath,
-	})
+	storageReq, err := selectStorage(opts.StorageType, opts.S3URI, storage)
+	if err != nil {
+		return nil, err
+	}
+	resolvedStorage, err := snapshotprotocol.ResolveCheckpointStorage(checkpointID, "", storageReq)
 	if err != nil {
 		return nil, err
 	}
@@ -77,6 +82,10 @@ func runCheckpointFlow(ctx context.Context, opts checkpointOptions) (*result, er
 		annotations[k] = v
 	}
 	annotations[snapshotprotocol.TargetContainersAnnotation] = targetValue
+	// Stamp the resolved storage backend so the per-node agent's
+	// checkpointLocationsFromPod uses the snapshotctl flags instead of
+	// falling back to its DaemonSet-level storage config.
+	snapshotprotocol.ApplyCheckpointStorageMetadata(annotations, resolvedStorage)
 
 	checkpointJobName := pod.Name + "-checkpoint"
 	job, err := snapshotprotocol.NewCheckpointJob(&corev1.PodTemplateSpec{

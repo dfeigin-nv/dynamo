@@ -30,8 +30,10 @@ openshift:
 
 # Storage configuration for checkpoints
 storage:
-  # Storage type stays snapshot-owned for future backend expansion.
-  # Only pvc is implemented today.
+  # Storage backend: "pvc" (default) writes through a ReadWriteMany PVC
+  # mounted into the snapshot-agent DaemonSet; "s3" streams CRIU images,
+  # rootfs-diff, and deleted-files directly to/from S3 via the agent's
+  # criu-image-streamer pipeline (no shared PVC required).
   type: pvc
 
   # How snapshot-agent accesses checkpoint storage:
@@ -67,9 +69,15 @@ storage:
     # into checkpoint/restore workload pods at the same path.
     basePath: /checkpoints
 
-  # Reserved for future snapshot-owned backends. Unsupported today.
+  # S3 backend configuration (when type=s3).
+  # Required: uri is the bucket+prefix root (e.g. s3://my-bucket/checkpoints).
+  # Per-checkpoint shards land at <uri>/<checkpointID>/versions/<v>/img-*.lz4.
+  # credentialsSecretRef references a Secret with AWS_ACCESS_KEY_ID /
+  # AWS_SECRET_ACCESS_KEY / AWS_REGION (or IRSA equivalents) — daemonset.yaml
+  # mounts it as envFrom on the agent container.
   s3:
     uri: ""
+    credentialsSecretRef: ""
 
   # Reserved for future snapshot-owned backends. Unsupported today.
   oci:

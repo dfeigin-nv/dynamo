@@ -21,6 +21,11 @@ type restoreOptions struct {
 	KubeContext  string
 	CheckpointID string
 	Containers   string
+	// StorageType is "pvc" (default), "s3", or "" to fall back to whatever the
+	// snapshot-agent DaemonSet advertises in its mounted PVC volume.
+	StorageType string
+	// S3URI is the s3://bucket/prefix root used when StorageType=="s3".
+	S3URI string
 }
 
 func runRestoreFlow(ctx context.Context, opts restoreOptions) (*result, error) {
@@ -61,13 +66,18 @@ func runRestoreFlow(ctx context.Context, opts restoreOptions) (*result, error) {
 
 	storage, err := discoverSnapshotStorage(ctx, clientset, namespace)
 	if err != nil {
+		// PVC discovery is optional for S3-mode restores: the operator
+		// (or --storage-type s3 + --s3-uri) supplies the backend directly.
+		if strings.ToLower(strings.TrimSpace(opts.StorageType)) != "s3" {
+			return nil, err
+		}
+		storage = snapshotprotocol.Storage{}
+	}
+	storageReq, err := selectStorage(opts.StorageType, opts.S3URI, storage)
+	if err != nil {
 		return nil, err
 	}
-	resolvedStorage, err := snapshotprotocol.ResolveRestoreStorage(checkpointID, snapshotprotocol.DefaultCheckpointArtifactVersion, "", snapshotprotocol.Storage{
-		Type:     snapshotprotocol.StorageTypePVC,
-		PVCName:  storage.PVCName,
-		BasePath: storage.BasePath,
-	})
+	resolvedStorage, err := snapshotprotocol.ResolveRestoreStorage(checkpointID, snapshotprotocol.DefaultCheckpointArtifactVersion, "", storageReq)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +94,7 @@ func runRestoreFlow(ctx context.Context, opts restoreOptions) (*result, error) {
 			annotations[k] = v
 		}
 		annotations[snapshotprotocol.TargetContainersAnnotation] = targetValue
+		snapshotprotocol.ApplyCheckpointStorageMetadata(annotations, resolvedStorage)
 
 		restorePod, err := snapshotprotocol.NewRestorePod(&corev1.Pod{
 			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Pod"},
@@ -133,6 +144,7 @@ func runRestoreFlow(ctx context.Context, opts restoreOptions) (*result, error) {
 			annotations[key] = value
 		}
 		snapshotprotocol.ApplyRestoreTargetMetadata(labels, annotations, true, checkpointID, snapshotprotocol.DefaultCheckpointArtifactVersion)
+		snapshotprotocol.ApplyCheckpointStorageMetadata(annotations, resolvedStorage)
 		annotations[snapshotprotocol.TargetContainersAnnotation] = targetValue
 		if err := snapshotprotocol.ValidateRestorePodSpec(&pod.Spec, annotations, resolvedStorage, snapshotprotocol.DefaultSeccompLocalhostProfile); err != nil {
 			return nil, fmt.Errorf("restore target pod %s/%s is not snapshot-compatible: %w", namespace, podName, err)

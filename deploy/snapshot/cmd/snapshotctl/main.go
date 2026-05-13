@@ -48,6 +48,8 @@ func runCheckpoint(args []string) error {
 	checkpointID := flags.String("checkpoint-id", "", "Explicit checkpoint ID; defaults to a generated value")
 	container := flags.String("container", "", "Required. Name of the workload container inside the manifest to checkpoint. May be omitted if the manifest already sets the nvidia.com/snapshot-target-containers annotation")
 	disableCudaCheckpointJobFile := flags.Bool("disable-cuda-checkpoint-job-file", false, "Preserve the manifest command instead of wrapping it with cuda-checkpoint --launch-job")
+	storageType := flags.String("storage-type", "", "Override discovered storage backend: pvc or s3 (defaults to whatever the snapshot-agent DaemonSet advertises)")
+	s3URI := flags.String("s3-uri", "", "S3 URI root (s3://bucket/prefix) when --storage-type=s3")
 	timeout := flags.Duration("timeout", 45*time.Minute, "Maximum time to wait for checkpoint completion")
 
 	if err := flags.Parse(args); err != nil {
@@ -68,6 +70,8 @@ func runCheckpoint(args []string) error {
 		CheckpointID:                 *checkpointID,
 		Container:                    *container,
 		DisableCudaCheckpointJobFile: *disableCudaCheckpointJobFile,
+		StorageType:                  *storageType,
+		S3URI:                        *s3URI,
 		Timeout:                      *timeout,
 	})
 	if err != nil {
@@ -94,6 +98,8 @@ func runRestore(args []string) error {
 	kubeContext := flags.String("kube-context", "", "Kubernetes context override")
 	checkpointID := flags.String("checkpoint-id", "", "Checkpoint ID to restore")
 	containers := flags.String("containers", "", "Required. Comma-separated target container names to restore the checkpoint into. May be omitted if the manifest/pod already sets the nvidia.com/snapshot-target-containers annotation")
+	storageType := flags.String("storage-type", "", "Override discovered storage backend: pvc or s3 (defaults to whatever the snapshot-agent DaemonSet advertises)")
+	s3URI := flags.String("s3-uri", "", "S3 URI root (s3://bucket/prefix) when --storage-type=s3")
 
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -113,6 +119,8 @@ func runRestore(args []string) error {
 		KubeContext:  *kubeContext,
 		CheckpointID: *checkpointID,
 		Containers:   *containers,
+		StorageType:  *storageType,
+		S3URI:        *s3URI,
 	})
 	if err != nil {
 		return err
