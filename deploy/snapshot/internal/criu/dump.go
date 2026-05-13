@@ -86,6 +86,72 @@ func BuildDumpOptions(
 	return criuOpts, nil
 }
 
+// BuildDumpOptionsNoConf is the streaming-dump variant of BuildDumpOptions.
+// It returns the assembled CriuOpts WITHOUT writing a criu.conf to disk —
+// the S3 streaming path writes its own criu.conf into a transient socket dir.
+func BuildDumpOptionsNoConf(
+	state *types.CheckpointContainerSnapshot,
+	settings *types.CRIUSettings,
+	log logr.Logger,
+) (*criurpc.CriuOpts, error) {
+	var maskedPaths []string
+	if state.OCISpec != nil && state.OCISpec.Linux != nil {
+		maskedPaths = state.OCISpec.Linux.MaskedPaths
+	}
+
+	externalized, skipped := snapshotruntime.BuildMountPolicy(state.Mounts, state.RootFS, maskedPaths)
+	log.V(1).Info("Resolved mount policy for CRIU streaming dump",
+		"externalized_count", len(externalized),
+		"skipped_count", len(skipped),
+	)
+
+	criuOpts := &criurpc.CriuOpts{
+		Pid:      proto.Int32(int32(state.PID)),
+		Root:     proto.String(state.RootFS),
+		LogFile:  proto.String(dumpLogFilename),
+		External: []string{fmt.Sprintf("net[%d]:extNetNs", state.NetNSInode)},
+	}
+	criuOpts.ExtMnt = toExtMountMaps(externalized)
+	criuOpts.SkipMnt = skipped
+
+	if state.HostCgroupPath != "" {
+		criuOpts.FreezeCgroup = proto.String(state.HostCgroupPath)
+	}
+
+	if settings == nil {
+		return criuOpts, nil
+	}
+
+	if err := applyCommonSettings(criuOpts, settings); err != nil {
+		return nil, err
+	}
+
+	criuOpts.LeaveRunning = proto.Bool(settings.LeaveRunning)
+	criuOpts.OrphanPtsMaster = proto.Bool(settings.OrphanPtsMaster)
+	criuOpts.ExtMasters = proto.Bool(settings.ExtMasters)
+	criuOpts.AutoDedup = proto.Bool(settings.AutoDedup)
+	criuOpts.LazyPages = proto.Bool(settings.LazyPages)
+
+	if settings.GhostLimit > 0 {
+		criuOpts.GhostLimit = proto.Uint32(settings.GhostLimit)
+	}
+
+	return criuOpts, nil
+}
+
+// BuildCRIUConf renders a criu.conf body for options that cannot be expressed
+// via RPC fields (e.g. libdir, allow-uprobes, skip-in-flight). Exported so the
+// S3 streaming dump path can compose it alongside the streaming RPC config.
+func BuildCRIUConf(c *types.CRIUSettings) string {
+	return buildCRIUConf(c)
+}
+
+// CRIUConfFilename is the standard filename for the per-dump criu.conf file.
+const CRIUConfFilename = criuConfFilename
+
+// DumpLogFilename is the standard filename CRIU writes the dump log to.
+const DumpLogFilename = dumpLogFilename
+
 // ExecuteDump opens the image directory FD, runs the CRIU dump, and cleans up.
 func ExecuteDump(
 	criuOpts *criurpc.CriuOpts,

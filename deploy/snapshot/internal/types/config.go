@@ -42,17 +42,29 @@ func (c *AgentConfig) Validate() error {
 	if storageType == "" {
 		storageType = "pvc"
 	}
-	if storageType != "pvc" {
-		return &ConfigError{Field: "storage.type", Message: fmt.Sprintf("unsupported storage type %q; only pvc is implemented today", storageType)}
+	switch storageType {
+	case "pvc":
+		basePath := strings.TrimSpace(c.Storage.BasePath)
+		if basePath == "" {
+			return &ConfigError{Field: "storage.basePath", Message: "storage.basePath is required when storage.type is pvc"}
+		}
+		if !strings.HasPrefix(basePath, "/") {
+			return &ConfigError{Field: "storage.basePath", Message: "storage.basePath must be an absolute path"}
+		}
+		c.Storage.BasePath = basePath
+	case "s3":
+		s3URI := strings.TrimSpace(c.Storage.S3URI)
+		if s3URI == "" {
+			return &ConfigError{Field: "storage.s3.uri", Message: "storage.s3.uri is required when storage.type is s3"}
+		}
+		if !strings.HasPrefix(s3URI, "s3://") {
+			return &ConfigError{Field: "storage.s3.uri", Message: fmt.Sprintf("storage.s3.uri %q must begin with s3://", s3URI)}
+		}
+		c.Storage.S3URI = s3URI
+	default:
+		return &ConfigError{Field: "storage.type", Message: fmt.Sprintf("unsupported storage type %q; expected pvc or s3", storageType)}
 	}
-	basePath := strings.TrimSpace(c.Storage.BasePath)
-	if basePath == "" {
-		return &ConfigError{Field: "storage.basePath", Message: "storage.basePath is required"}
-	}
-	if !strings.HasPrefix(basePath, "/") {
-		return &ConfigError{Field: "storage.basePath", Message: "storage.basePath must be an absolute path"}
-	}
-	c.Storage.BasePath = basePath
+	c.Storage.Type = storageType
 	accessMode := strings.TrimSpace(c.Storage.AccessMode)
 	if accessMode == "" {
 		accessMode = StorageAccessModeAgentMount
@@ -80,6 +92,9 @@ type StorageSpec struct {
 	Type       string `yaml:"type"`
 	BasePath   string `yaml:"basePath"`
 	AccessMode string `yaml:"accessMode"`
+
+	// S3URI is the s3://bucket/prefix root for S3 storage. Required when Type is "s3".
+	S3URI string `yaml:"s3URI"`
 }
 
 // RestoreSpec holds settings for the CRIU restore process.

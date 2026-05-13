@@ -16,22 +16,29 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/criu"
+	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/criu/streams3"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/cuda"
 	snapshotruntime "github.com/ai-dynamo/dynamo/deploy/snapshot/internal/runtime"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
+	snapshotprotocol "github.com/ai-dynamo/dynamo/deploy/snapshot/protocol"
 )
 
 // CheckpointRequest holds per-checkpoint identifiers for a checkpoint operation.
 type CheckpointRequest struct {
-	ContainerID        string
-	ContainerName      string
-	CheckpointID       string
+	ContainerID   string
+	ContainerName string
+	CheckpointID  string
+	// CheckpointLocation is the resolved per-checkpoint location:
+	//   - PVC: absolute host-side filesystem path
+	//   - S3:  s3://bucket/prefix/<checkpointID>/versions/<artifactVersion>
 	CheckpointLocation string
-	StartedAt          time.Time
-	NodeName           string
-	PodName            string
-	PodNamespace       string
-	Clientset          kubernetes.Interface
+	// CheckpointStorageType is "pvc" (default) or "s3"; controls dispatch.
+	CheckpointStorageType string
+	StartedAt             time.Time
+	NodeName              string
+	PodName               string
+	PodNamespace          string
+	Clientset             kubernetes.Interface
 }
 
 type checkpointPhaseTimings struct {
@@ -60,6 +67,51 @@ func Checkpoint(ctx context.Context, rt snapshotruntime.Runtime, log logr.Logger
 	if req.CheckpointLocation == "" {
 		return fmt.Errorf("checkpoint location is required")
 	}
+	storageType := strings.TrimSpace(req.CheckpointStorageType)
+	if storageType == "" {
+		storageType = snapshotprotocol.StorageTypePVC
+	}
+	switch storageType {
+	case snapshotprotocol.StorageTypePVC, snapshotprotocol.StorageTypeS3:
+	default:
+		return fmt.Errorf("checkpoint storage type %q is not supported (must be pvc or s3)", storageType)
+	}
+
+	// Phase 1: Inspect container state (shared across pvc/s3 paths).
+	state, err := inspectContainer(ctx, rt, log, req)
+	if err != nil {
+		return err
+	}
+
+	if storageType == snapshotprotocol.StorageTypeS3 {
+		phaseTimings.PrepareDuration = time.Since(prepareStart)
+		captureTimings, err := captureCheckpointS3(ctx, log, req, cfg, state)
+		if err != nil {
+			return err
+		}
+		phaseTimings.CUDADuration = captureTimings.CUDADuration
+		phaseTimings.CRIUDumpDuration = captureTimings.CRIUDumpDuration
+		// S3 path has no overlay or finalize phase: rootfs-diff is embedded in
+		// the image stream and shards are renamed-on-upload by S3 multipart.
+		totalDuration := time.Since(checkpointStart)
+		log.Info("Checkpoint timing summary",
+			"checkpoint", map[string]any{
+				"duration":     totalDuration.String(),
+				"storage_type": "s3",
+				"phases": map[string]string{
+					"prepare_duration":   phaseTimings.PrepareDuration.String(),
+					"cuda_duration":      phaseTimings.CUDADuration.String(),
+					"criu_dump_duration": phaseTimings.CRIUDumpDuration.String(),
+				},
+			},
+		)
+		if !req.StartedAt.IsZero() {
+			log.Info("Checkpoint wall time from agent detection",
+				"started_to_checkpoint_complete", time.Since(req.StartedAt),
+			)
+		}
+		return nil
+	}
 
 	finalDir := req.CheckpointLocation
 	tmpRoot := filepath.Join(filepath.Dir(finalDir), "tmp")
@@ -71,12 +123,6 @@ func Checkpoint(ctx context.Context, rt snapshotruntime.Runtime, log logr.Logger
 		return fmt.Errorf("failed to create checkpoint staging directory: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
-
-	// Phase 1: Inspect container state
-	state, err := inspectContainer(ctx, rt, log, req)
-	if err != nil {
-		return err
-	}
 
 	// Phase 2: Configure CRIU options and build checkpoint manifest
 	criuOpts, data, err := configureCheckpoint(log, state, req, cfg, tmpDir)
@@ -236,7 +282,7 @@ func configureCheckpoint(
 		req.CheckpointID,
 		types.NewCRIUDumpManifest(criuOpts, cfg.CRIU),
 		types.NewSourcePodManifest(req.ContainerID, state.PID, req.NodeName, req.PodName, req.PodNamespace, state.StdioFDs),
-		types.NewOverlayManifest(cfg.Overlay, state.UpperDir, state.OCISpec),
+		types.NewOverlayManifest(cfg.Overlay, state.UpperDir, state.OCISpec, state.Mounts),
 	)
 	if len(state.CUDANSPIDs) > 0 {
 		m.CUDA = types.NewCUDAManifest(state.CUDANSPIDs, state.GPUUUIDs)
@@ -282,4 +328,116 @@ func captureCheckpoint(ctx context.Context, criuOpts *criurpc.CriuOpts, criuSett
 	}
 
 	return timings, nil
+}
+
+// captureCheckpointS3 runs the S3 streaming (or direct, when S3_DIRECT=1) dump
+// path. The CRIU image stream, rootfs-diff tarball, and deleted-files list go
+// straight to S3 via criu-image-streamer pipes — no shared PVC or local staging
+// directory required.
+func captureCheckpointS3(
+	ctx context.Context,
+	log logr.Logger,
+	req CheckpointRequest,
+	cfg *types.AgentConfig,
+	state *types.CheckpointContainerSnapshot,
+) (*checkpointPhaseTimings, error) {
+	timings := &checkpointPhaseTimings{}
+
+	// CUDA lock+checkpoint must happen before CRIU dump.
+	if len(state.CUDAHostPIDs) > 0 {
+		cudaTimings, err := cuda.LockAndCheckpointProcessTree(ctx, state.CUDAHostPIDs, log)
+		if err != nil {
+			return nil, fmt.Errorf("CUDA checkpoint failed: %w", err)
+		}
+		timings.CUDADuration = cudaTimings.TotalDuration
+	}
+
+	// Build CRIU opts + manifest without writing them to a local checkpoint dir.
+	criuOpts, manifest, err := configureCheckpointNoDir(log, state, req, cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	// req.CheckpointLocation includes the per-checkpoint suffix
+	// (e.g. s3://bucket/prefix/<checkpointID>/versions/<v>). The streamer
+	// expects (s3Prefix, hash) as separate args; split on the checkpoint ID.
+	s3Prefix, hash, err := splitS3Location(req.CheckpointLocation, req.CheckpointID)
+	if err != nil {
+		return nil, err
+	}
+
+	if os.Getenv("S3_DIRECT") == "1" {
+		log.Info("Using S3 direct checkpoint path (S3_DIRECT=1)")
+		criuDumpDuration, err := streams3.ExecuteDumpS3Direct(
+			criuOpts, &cfg.CRIU, manifest, state.UpperDir, s3Prefix, hash, log,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("S3 direct checkpoint failed: %w", err)
+		}
+		timings.CRIUDumpDuration = criuDumpDuration
+		return timings, nil
+	}
+
+	criuDumpDuration, err := streams3.ExecuteDumpS3(
+		criuOpts, &cfg.CRIU, manifest, state.UpperDir, s3Prefix, hash, 0, log,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("S3 streaming checkpoint failed: %w", err)
+	}
+	timings.CRIUDumpDuration = criuDumpDuration
+	return timings, nil
+}
+
+// configureCheckpointNoDir is the streaming-S3 variant of configureCheckpoint:
+// it returns CriuOpts + manifest WITHOUT writing manifest.yaml or criu.conf to
+// a local checkpoint dir. The streamer handles writing those into its own
+// transient socket dir.
+func configureCheckpointNoDir(log logr.Logger, state *types.CheckpointContainerSnapshot,
+	req CheckpointRequest, cfg *types.AgentConfig) (*criurpc.CriuOpts, *types.CheckpointManifest, error) {
+
+	criuOpts, err := criu.BuildDumpOptionsNoConf(state, &cfg.CRIU, log)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	m := types.NewCheckpointManifest(
+		req.CheckpointID,
+		types.NewCRIUDumpManifest(criuOpts, cfg.CRIU),
+		types.NewSourcePodManifest(req.ContainerID, state.PID, req.NodeName, req.PodName, req.PodNamespace, state.StdioFDs),
+		types.NewOverlayManifest(cfg.Overlay, state.UpperDir, state.OCISpec, state.Mounts),
+	)
+	if len(state.CUDANSPIDs) > 0 {
+		m.CUDA = types.NewCUDAManifest(state.CUDANSPIDs, state.GPUUUIDs)
+	}
+	// Manifest is NOT written to disk — ExecuteDumpS3 embeds it in the stream
+	// and UploadManifestS3 also publishes it as a standalone S3 object.
+
+	return criuOpts, m, nil
+}
+
+// splitS3Location takes a fully-resolved S3 checkpoint location
+// (e.g. s3://bucket/prefix/<checkpointID>/versions/<v>) and returns
+// (s3Prefix, hashSegment) such that streams3 lays out shard objects at
+// <s3Prefix>/<hashSegment>/img-*. We split on the final path segment so the
+// shard tree lands directly inside the per-checkpoint+version location.
+// checkpointID is used as a sanity check that the location belongs to the
+// expected checkpoint (catches mis-routed restore requests early).
+func splitS3Location(location, checkpointID string) (string, string, error) {
+	if !strings.HasPrefix(location, "s3://") {
+		return "", "", fmt.Errorf("S3 checkpoint location %q must begin with s3://", location)
+	}
+	if id := strings.TrimSpace(checkpointID); id != "" && !strings.Contains(location, "/"+id+"/") && !strings.HasSuffix(strings.TrimRight(location, "/"), "/"+id) {
+		return "", "", fmt.Errorf("S3 checkpoint location %q does not contain checkpoint id %q", location, id)
+	}
+	trimmed := strings.TrimRight(location, "/")
+	idx := strings.LastIndex(trimmed, "/")
+	if idx <= len("s3://") {
+		return "", "", fmt.Errorf("S3 checkpoint location %q is missing a trailing segment", location)
+	}
+	prefix := trimmed[:idx]
+	hash := trimmed[idx+1:]
+	if hash == "" {
+		return "", "", fmt.Errorf("S3 checkpoint location %q has empty trailing segment", location)
+	}
+	return prefix, hash, nil
 }

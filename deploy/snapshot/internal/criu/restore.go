@@ -23,6 +23,37 @@ const (
 	placeholderFDDir = "/proc/1/fd"
 )
 
+// NetNsPath is the per-pod network namespace inode path the agent inherits
+// across the placeholder boundary. Exported for internal/criu/streams3.
+const NetNsPath = netNsPath
+
+// RegisterInheritFDs is the exported alias of registerInheritFDs for cross-package
+// callers (e.g. internal/criu/streams3) that share the same FD lifetime contract.
+func RegisterInheritFDs(c *criulib.Criu, stdioFDs []string, log logr.Logger) []*os.File {
+	return registerInheritFDs(c, stdioFDs, log)
+}
+
+// CloseFiles is the exported alias of closeFiles.
+func CloseFiles(files []*os.File) {
+	closeFiles(files)
+}
+
+// RestoreNotify is the exported alias of the unexported restoreNotify type for
+// cross-package callers (e.g. internal/criu/streams3) that need to drive a
+// go-criu Restore call directly.
+type RestoreNotify = restoreNotify
+
+// NewRestoreNotify constructs a RestoreNotify bound to log. Callers read the
+// restored PID via the returned struct's RestoredPID method after Restore.
+func NewRestoreNotify(log logr.Logger) *RestoreNotify {
+	return &restoreNotify{log: log}
+}
+
+// RestoredPID returns the PID reported by CRIU's PostRestore callback.
+func (n *restoreNotify) RestoredPID() int32 {
+	return n.restoredPID
+}
+
 // ExecuteRestore opens the image/work directory FDs, configures inherited
 // resources, and calls go-criu Restore. Returns the namespace-relative PID.
 func ExecuteRestore(

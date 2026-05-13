@@ -16,19 +16,34 @@ func main() {
 	// Logs go to stderr so stdout is reserved for the structured result.
 	log := logging.ConfigureLogger("stderr").WithName("nsrestore")
 
-	checkpointPath := flag.String("checkpoint-path", "", "Path to checkpoint directory")
+	checkpointPath := flag.String("checkpoint-path", "", "Path to checkpoint directory (pvc mode)")
+	checkpointStorageType := flag.String("checkpoint-storage-type", "pvc", "Storage type: pvc or s3")
+	checkpointLocation := flag.String("checkpoint-location", "", "S3 URI prefix for checkpoint (s3 mode)")
+	checkpointHash := flag.String("checkpoint-hash", "", "Checkpoint hash / per-checkpoint S3 segment (s3 mode)")
 	cudaDeviceMap := flag.String("cuda-device-map", "", "CUDA device map for cuda-checkpoint-helper restore")
 	cgroupRoot := flag.String("cgroup-root", "", "CRIU cgroup root remap path")
 	flag.Parse()
 
-	if *checkpointPath == "" {
-		fatal(log, nil, "--checkpoint-path is required")
+	if *checkpointStorageType == "s3" {
+		if *checkpointLocation == "" {
+			fatal(log, nil, "--checkpoint-location is required for s3 storage type")
+		}
+		if *checkpointHash == "" {
+			fatal(log, nil, "--checkpoint-hash is required for s3 storage type")
+		}
+	} else {
+		if *checkpointPath == "" {
+			fatal(log, nil, "--checkpoint-path is required for pvc storage type")
+		}
 	}
 
 	opts := executor.RestoreOptions{
-		CheckpointPath: *checkpointPath,
-		CUDADeviceMap:  *cudaDeviceMap,
-		CgroupRoot:     *cgroupRoot,
+		CheckpointPath:        *checkpointPath,
+		CheckpointStorageType: *checkpointStorageType,
+		CheckpointLocation:    *checkpointLocation,
+		CheckpointHash:        *checkpointHash,
+		CUDADeviceMap:         *cudaDeviceMap,
+		CgroupRoot:            *cgroupRoot,
 	}
 
 	result, err := executor.RestoreInNamespace(context.Background(), opts, log)

@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
 	"syscall"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/go-logr/logr"
 
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/criu"
+	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/criu/streams3"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/cuda"
 	snapshotruntime "github.com/ai-dynamo/dynamo/deploy/snapshot/internal/runtime"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
@@ -18,8 +20,13 @@ import (
 // RestoreOptions holds configuration for an in-namespace restore.
 type RestoreOptions struct {
 	CheckpointPath string
-	CUDADeviceMap  string
-	CgroupRoot     string
+	// CheckpointStorageType is "pvc" (default) or "s3". For "s3",
+	// CheckpointLocation + CheckpointHash drive the streamer.
+	CheckpointStorageType string
+	CheckpointLocation    string
+	CheckpointHash        string
+	CUDADeviceMap         string
+	CgroupRoot            string
 }
 
 type RestoreInNamespaceResult struct {
@@ -34,9 +41,17 @@ func RestoreInNamespace(ctx context.Context, opts RestoreOptions, log logr.Logge
 	restoreStart := time.Now()
 	log.Info("Starting nsrestore workflow",
 		"checkpoint_path", opts.CheckpointPath,
+		"checkpoint_storage_type", opts.CheckpointStorageType,
 		"has_cuda_map", opts.CUDADeviceMap != "",
 		"cgroup_root", opts.CgroupRoot,
 	)
+
+	// S3 path: the streamer-served restore handles manifest read + CRIU restore
+	// in one shot. It does its own rootfs-diff and deleted-files apply via the
+	// streamer's ext-file pipes, so executeRestore's pvc-side helpers don't apply.
+	if opts.CheckpointStorageType == "s3" {
+		return restoreInNamespaceS3(ctx, opts, log)
+	}
 
 	manifestReadStart := time.Now()
 	m, err := types.ReadManifest(opts.CheckpointPath)
@@ -165,4 +180,84 @@ func executeRestore(ctx context.Context, criuOpts *criurpc.CriuOpts, m *types.Ch
 	timings.cudaDuration = time.Since(cudaStart)
 
 	return timings, int(restoredPID), nil
+}
+
+// restoreInNamespaceS3 is the S3 streaming variant of RestoreInNamespace.
+// The streamer-served pipeline downloads the image stream from S3, materializes
+// it into memfds, applies the embedded rootfs-diff and deleted-files lists,
+// and then drives CRIU restore — all in one ExecuteRestoreS3 call.
+func restoreInNamespaceS3(ctx context.Context, opts RestoreOptions, log logr.Logger) (*RestoreInNamespaceResult, error) {
+	if opts.CheckpointLocation == "" {
+		return nil, fmt.Errorf("S3 restore requires --checkpoint-location (s3:// prefix)")
+	}
+	if opts.CheckpointHash == "" {
+		return nil, fmt.Errorf("S3 restore requires --checkpoint-hash (per-checkpoint segment)")
+	}
+
+	// Prepare the namespace for restore the same way the PVC path does:
+	// unmount /dev/shm so CRIU can re-create tmpfs with the checkpointed content,
+	// and remount /proc/sys read-write for the restore window.
+	setupStart := time.Now()
+	if err := syscall.Unmount("/dev/shm", 0); err != nil {
+		return nil, fmt.Errorf("failed to unmount /dev/shm before restore: %w", err)
+	}
+	if err := snapshotruntime.RemountProcSys(true); err != nil {
+		return nil, fmt.Errorf("failed to remount /proc/sys read-write for restore: %w", err)
+	}
+	setupDuration := time.Since(setupStart)
+	defer func() {
+		if err := snapshotruntime.RemountProcSys(false); err != nil {
+			log.Error(err, "Failed to remount /proc/sys read-only after restore")
+		}
+	}()
+
+	// Choose direct vs streamed S3 path based on S3_DIRECT env (same gate as dump).
+	var manifest *types.CheckpointManifest
+	var restoredPID int32
+	var err error
+	criuRestoreStart := time.Now()
+	if os.Getenv("S3_DIRECT") == "1" {
+		manifest, restoredPID, err = streams3.ExecuteRestoreS3Direct(
+			opts.CheckpointLocation, opts.CheckpointHash, opts.CgroupRoot, log,
+		)
+	} else {
+		manifest, restoredPID, err = streams3.ExecuteRestoreS3(
+			opts.CheckpointLocation, opts.CheckpointHash, 0, opts.CgroupRoot, log,
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	criuRestoreDuration := time.Since(criuRestoreStart)
+
+	// CUDA restore — same PID remap dance as the PVC path, but using the
+	// process tree visible inside this namespace.
+	cudaStart := time.Now()
+	var cudaDuration time.Duration
+	if !manifest.CUDA.IsEmpty() {
+		processes, err := snapshotruntime.ReadProcessTable("/proc")
+		if err != nil {
+			return nil, fmt.Errorf("failed to read restored process table: %w", err)
+		}
+		restorePIDs, err := snapshotruntime.ResolveManifestPIDsToObservedPIDs(processes, int(restoredPID), manifest.CUDA.PIDs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve restored CUDA PIDs: %w", err)
+		}
+		log.V(1).Info("Resolved manifest CUDA PIDs to current restore PIDs",
+			"manifest_cuda_pids", manifest.CUDA.PIDs,
+			"restored_cuda_pids", restorePIDs,
+			"criu_callback_pid", restoredPID,
+		)
+		if _, err := cuda.RestoreAndUnlockProcessTree(ctx, restorePIDs, opts.CUDADeviceMap, log); err != nil {
+			return nil, fmt.Errorf("CUDA restore failed: %w", err)
+		}
+		cudaDuration = time.Since(cudaStart)
+	}
+
+	return &RestoreInNamespaceResult{
+		RestoredPID:            int(restoredPID),
+		NSRestoreSetupDuration: setupDuration,
+		CRIURestoreDuration:    criuRestoreDuration,
+		CUDADuration:           cudaDuration,
+	}, nil
 }

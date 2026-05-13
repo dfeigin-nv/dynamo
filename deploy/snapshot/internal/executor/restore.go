@@ -16,10 +16,12 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/criu"
+	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/criu/streams3"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/cuda"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/logging"
 	snapshotruntime "github.com/ai-dynamo/dynamo/deploy/snapshot/internal/runtime"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
+	snapshotprotocol "github.com/ai-dynamo/dynamo/deploy/snapshot/protocol"
 )
 
 // RestoreRequest holds the parameters for a restore operation.
@@ -27,6 +29,7 @@ type RestoreRequest struct {
 	CheckpointID                string
 	CheckpointLocation          string
 	ContainerCheckpointLocation string
+	CheckpointStorageType       string
 	StartedAt                   time.Time
 	NSRestorePath               string
 	PodName                     string
@@ -108,21 +111,34 @@ func inspectRestore(ctx context.Context, rt snapshotruntime.Runtime, log logr.Lo
 	}
 
 	checkpointPath := req.CheckpointLocation
-	baseAbs, err := filepath.Abs(filepath.Dir(checkpointPath))
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve checkpoint base path: %w", err)
-	}
-	checkpointAbs, err := filepath.Abs(checkpointPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve checkpoint path: %w", err)
-	}
-	if checkpointAbs != baseAbs && !strings.HasPrefix(checkpointAbs, baseAbs+string(os.PathSeparator)) {
-		return nil, fmt.Errorf("invalid checkpoint id %q", req.CheckpointID)
-	}
 
-	m, err := types.ReadManifest(checkpointPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read checkpoint manifest: %w", err)
+	var m *types.CheckpointManifest
+	if req.CheckpointStorageType == snapshotprotocol.StorageTypeS3 {
+		s3Prefix, hash, err := splitS3Location(checkpointPath, req.CheckpointID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid S3 checkpoint location: %w", err)
+		}
+		m, err = streams3.DownloadManifestS3(s3Prefix, hash)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download checkpoint manifest from S3: %w", err)
+		}
+	} else {
+		baseAbs, err := filepath.Abs(filepath.Dir(checkpointPath))
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve checkpoint base path: %w", err)
+		}
+		checkpointAbs, err := filepath.Abs(checkpointPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve checkpoint path: %w", err)
+		}
+		if checkpointAbs != baseAbs && !strings.HasPrefix(checkpointAbs, baseAbs+string(os.PathSeparator)) {
+			return nil, fmt.Errorf("invalid checkpoint id %q", req.CheckpointID)
+		}
+
+		m, err = types.ReadManifest(checkpointPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read checkpoint manifest: %w", err)
+		}
 	}
 
 	containerName := req.ContainerName
@@ -187,11 +203,12 @@ func inspectRestore(ctx context.Context, rt snapshotruntime.Runtime, log logr.Lo
 // namespaces via nsenter and parses the restored PID from stdout JSON.
 func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, snap *types.RestoreContainerSnapshot) (*RestoreInNamespaceResult, error) {
 	checkpointPath := req.ContainerCheckpointLocation
-	if checkpointPath != "" && !filepath.IsAbs(checkpointPath) {
-		return nil, fmt.Errorf("container checkpoint location must be absolute: %q", checkpointPath)
-	}
 	if checkpointPath == "" {
 		checkpointPath = snap.CheckpointPath
+	}
+	isS3 := req.CheckpointStorageType == snapshotprotocol.StorageTypeS3
+	if !isS3 && checkpointPath != "" && !filepath.IsAbs(checkpointPath) {
+		return nil, fmt.Errorf("container checkpoint location must be absolute: %q", checkpointPath)
 	}
 	args := []string{
 		"-t", strconv.Itoa(snap.PlaceholderPID),
@@ -199,7 +216,19 @@ func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, sna
 		// from the host-visible hierarchy so --cgroup-root remap works.
 		"-m", "-u", "-i", "-n", "-p",
 		"--", req.NSRestorePath,
-		"--checkpoint-path", checkpointPath,
+	}
+	if isS3 {
+		s3Prefix, hash, err := splitS3Location(checkpointPath, req.CheckpointID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid S3 checkpoint location: %w", err)
+		}
+		args = append(args,
+			"--checkpoint-storage-type", "s3",
+			"--checkpoint-location", s3Prefix,
+			"--checkpoint-hash", hash,
+		)
+	} else {
+		args = append(args, "--checkpoint-path", checkpointPath)
 	}
 	if snap.CUDADeviceMap != "" {
 		args = append(args, "--cuda-device-map", snap.CUDADeviceMap)

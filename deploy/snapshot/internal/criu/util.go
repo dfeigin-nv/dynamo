@@ -64,6 +64,12 @@ func applyCommonSettings(opts *criurpc.CriuOpts, settings *types.CRIUSettings) e
 	return nil
 }
 
+// OpenPathForCRIU is the exported alias of openPathForCRIU for cross-package
+// callers (e.g. internal/criu/streams3) that share the same lifetime contract.
+func OpenPathForCRIU(path string) (*os.File, int32, error) {
+	return openPathForCRIU(path)
+}
+
 // openPathForCRIU opens a path (directory or file) and clears the CLOEXEC flag
 // so the FD can be inherited by CRIU child processes.
 // Returns the opened file and its FD. Caller must close the file when done.

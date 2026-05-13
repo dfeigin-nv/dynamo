@@ -49,6 +49,10 @@ type NodeController struct {
 type checkpointLocations struct {
 	HostPath      string
 	ContainerPath string
+	// StorageType identifies the storage backend ("pvc" or "s3"). The agent
+	// uses this to decide whether to stat HostPath as a real filesystem path
+	// (pvc) or treat it as an S3 URI (s3).
+	StorageType string
 }
 
 // NewNodeController creates the node-local controller that runs inside snapshot-agent.
@@ -340,13 +344,15 @@ func (w *NodeController) maybeStartRestoreForContainer(
 		w.log.Error(err, "Restore placeholder container changed before storage access", "pod", podKey, "container", containerName)
 		return
 	}
-	checkpointReady, err := w.restoreCheckpointReady(w.log, podKey, checkpointID, checkpointLocation.HostPath)
-	if err != nil {
-		w.log.Error(err, "Restore checkpoint path is invalid", "pod", podKey, "checkpoint_id", checkpointID, "checkpoint_location", checkpointLocation.HostPath)
-		return
-	}
-	if !checkpointReady {
-		return
+	if checkpointLocation.StorageType != snapshotprotocol.StorageTypeS3 {
+		checkpointReady, err := w.restoreCheckpointReady(w.log, podKey, checkpointID, checkpointLocation.HostPath)
+		if err != nil {
+			w.log.Error(err, "Restore checkpoint path is invalid", "pod", podKey, "checkpoint_id", checkpointID, "checkpoint_location", checkpointLocation.HostPath)
+			return
+		}
+		if !checkpointReady {
+			return
+		}
 	}
 
 	restoreAttemptKey := fmt.Sprintf("%s/%s/%s", podKey, containerName, containerID)
@@ -462,15 +468,16 @@ func (w *NodeController) runCheckpoint(ctx context.Context, pod *corev1.Pod, job
 
 	// Step 1: Run the checkpoint orchestrator
 	req := executor.CheckpointRequest{
-		ContainerID:        containerID,
-		ContainerName:      containerName,
-		CheckpointID:       checkpointID,
-		CheckpointLocation: checkpointLocation.HostPath,
-		StartedAt:          startedAt,
-		NodeName:           w.config.NodeName,
-		PodName:            pod.Name,
-		PodNamespace:       pod.Namespace,
-		Clientset:          w.clientset,
+		ContainerID:           containerID,
+		ContainerName:         containerName,
+		CheckpointID:          checkpointID,
+		CheckpointLocation:    checkpointLocation.HostPath,
+		CheckpointStorageType: checkpointLocation.StorageType,
+		StartedAt:             startedAt,
+		NodeName:              w.config.NodeName,
+		PodName:               pod.Name,
+		PodNamespace:          pod.Namespace,
+		Clientset:             w.clientset,
 	}
 	if err := executor.Checkpoint(leaseCtx, w.runtime, log, req, w.config); err != nil {
 		if cause := context.Cause(leaseCtx); cause != nil && cause != context.Canceled {
@@ -488,22 +495,26 @@ func (w *NodeController) runCheckpoint(ctx context.Context, pod *corev1.Pod, job
 		return nil
 	}
 
-	info, err := os.Stat(checkpointLocation.HostPath)
-	if err != nil || !info.IsDir() {
-		if err == nil {
-			err = fmt.Errorf("published checkpoint path %s is not a directory", checkpointLocation.HostPath)
-		} else {
-			err = fmt.Errorf("published checkpoint path %s is missing: %w", checkpointLocation.HostPath, err)
+	// S3 checkpoints have no host-side filesystem to stat; the streaming dump
+	// succeeded iff executor.Checkpoint returned nil above.
+	if checkpointLocation.StorageType != snapshotprotocol.StorageTypeS3 {
+		info, err := os.Stat(checkpointLocation.HostPath)
+		if err != nil || !info.IsDir() {
+			if err == nil {
+				err = fmt.Errorf("published checkpoint path %s is not a directory", checkpointLocation.HostPath)
+			} else {
+				err = fmt.Errorf("published checkpoint path %s is missing: %w", checkpointLocation.HostPath, err)
+			}
+			log.Error(err, "Checkpoint failed verification")
+			emitPodEvent(ctx, w.clientset, log, pod, "snapshot", corev1.EventTypeWarning, "CheckpointFailed", err.Error())
+			if signalErr := snapshotruntime.SendSignalToPID(log, containerPID, syscall.SIGKILL, "checkpoint verification failed"); signalErr != nil {
+				log.Error(signalErr, "Failed to signal checkpoint verification failure to runtime process")
+			}
+			if statusErr := setCheckpointStatus(snapshotprotocol.CheckpointStatusFailed); statusErr != nil {
+				return statusErr
+			}
+			return nil
 		}
-		log.Error(err, "Checkpoint failed verification")
-		emitPodEvent(ctx, w.clientset, log, pod, "snapshot", corev1.EventTypeWarning, "CheckpointFailed", err.Error())
-		if signalErr := snapshotruntime.SendSignalToPID(log, containerPID, syscall.SIGKILL, "checkpoint verification failed"); signalErr != nil {
-			log.Error(signalErr, "Failed to signal checkpoint verification failure to runtime process")
-		}
-		if statusErr := setCheckpointStatus(snapshotprotocol.CheckpointStatusFailed); statusErr != nil {
-			return statusErr
-		}
-		return nil
 	}
 
 	// Step 2: Sentinel on success. Workload observes via polling on the
@@ -564,12 +575,15 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 	if err != nil {
 		return fmt.Errorf("refresh restore checkpoint location: %w", err)
 	}
-	checkpointReady, err := w.restoreCheckpointReady(log, podKey, checkpointID, checkpointLocation.HostPath)
-	if err != nil {
-		return fmt.Errorf("validate refreshed checkpoint location: %w", err)
-	}
-	if !checkpointReady {
-		return nil
+	// S3 checkpoints can't be stat'd; skip the filesystem readiness probe.
+	if checkpointLocation.StorageType != snapshotprotocol.StorageTypeS3 {
+		checkpointReady, err := w.restoreCheckpointReady(log, podKey, checkpointID, checkpointLocation.HostPath)
+		if err != nil {
+			return fmt.Errorf("validate refreshed checkpoint location: %w", err)
+		}
+		if !checkpointReady {
+			return nil
+		}
 	}
 
 	if err := setRestoreStatus(snapshotprotocol.RestoreStatusInProgress); err != nil {
@@ -581,6 +595,7 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 		CheckpointID:                checkpointID,
 		CheckpointLocation:          checkpointLocation.HostPath,
 		ContainerCheckpointLocation: checkpointLocation.ContainerPath,
+		CheckpointStorageType:       checkpointLocation.StorageType,
 		StartedAt:                   startedAt,
 		NSRestorePath:               w.config.Restore.NSRestorePath,
 		PodName:                     pod.Name,
@@ -656,12 +671,17 @@ func (w *NodeController) checkpointLocationsFromPod(pod *corev1.Pod, checkpointI
 	if storageType == "" {
 		storageType = w.config.Storage.Type
 	}
+	s3URI := strings.TrimSpace(pod.Annotations[snapshotprotocol.CheckpointStorageS3URIAnnotation])
+	if s3URI == "" {
+		s3URI = strings.TrimSpace(w.config.Storage.S3URI)
+	}
 	resolvedStorage, err := snapshotprotocol.ResolveCheckpointStorage(
 		checkpointID,
 		strings.TrimSpace(pod.Annotations[snapshotprotocol.CheckpointArtifactVersionAnnotation]),
 		snapshotprotocol.Storage{
 			Type:     storageType,
 			BasePath: basePath,
+			S3URI:    s3URI,
 		},
 	)
 	if err != nil {
@@ -669,6 +689,15 @@ func (w *NodeController) checkpointLocationsFromPod(pod *corev1.Pod, checkpointI
 	}
 
 	location := resolvedStorage.Location
+	// S3 locations live in object storage; there is no host-side filesystem
+	// path to validate or reroute through /host/proc/<pid>/root.
+	if resolvedStorage.Type == snapshotprotocol.StorageTypeS3 {
+		return checkpointLocations{
+			HostPath:      location,
+			ContainerPath: location,
+			StorageType:   snapshotprotocol.StorageTypeS3,
+		}, nil
+	}
 	if !filepath.IsAbs(location) || filepath.Clean(location) != location {
 		return checkpointLocations{}, fmt.Errorf("checkpoint location must be an absolute, clean path: %q", location)
 	}
@@ -682,9 +711,9 @@ func (w *NodeController) checkpointLocationsFromPod(pod *corev1.Pod, checkpointI
 			"root",
 			strings.TrimPrefix(location, string(os.PathSeparator)),
 		)
-		return checkpointLocations{HostPath: hostLocation, ContainerPath: location}, nil
+		return checkpointLocations{HostPath: hostLocation, ContainerPath: location, StorageType: snapshotprotocol.StorageTypePVC}, nil
 	}
-	return checkpointLocations{HostPath: location, ContainerPath: location}, nil
+	return checkpointLocations{HostPath: location, ContainerPath: location, StorageType: snapshotprotocol.StorageTypePVC}, nil
 }
 
 func (w *NodeController) refreshRestoreCheckpointLocation(ctx context.Context, pod *corev1.Pod, containerID string, checkpointID string, checkpointLocation checkpointLocations) (checkpointLocations, error) {

@@ -16,12 +16,18 @@
 # =============================================================================
 ARG DOCKER_PROXY
 ARG GO_VERSION=1.25
-# Default to upstream CRIU development branch. Custom forks can override both
-# args at build time, for example:
+# Default to the dynamo-snapshot CRIU fork that carries the streaming +
+# AIO + parallel-memfd restore work. Custom forks can override both args at
+# build time, for example:
 #   --build-arg CRIU_REPO=<git-remote-url>
 #   --build-arg CRIU_REF=<fork-branch-or-sha>
-ARG CRIU_REPO=https://github.com/checkpoint-restore/criu.git
-ARG CRIU_REF=criu-dev
+ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
+ARG CRIU_REF=add-aio-and-parallel-memfd
+
+# criu-image-streamer is the Rust binary that multiplexes CRIU image data
+# through S3 shard pipes; build it alongside CRIU from the upstream repo.
+ARG CIS_REPO=https://github.com/checkpoint-restore/criu-image-streamer.git
+ARG CIS_REF=main
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
 # For placeholder target only - this default allows agent builds to succeed,
@@ -133,6 +139,25 @@ RUN git init /tmp/criu \
 RUN git clone https://github.com/NVIDIA/cuda-checkpoint.git /tmp/cuda-checkpoint
 
 # =============================================================================
+# Stage: criu-image-streamer Builder - Rust binary used by S3 streaming dump/restore
+# =============================================================================
+FROM rust:1.82-slim AS criu-image-streamer-builder
+
+ARG CIS_REPO
+ARG CIS_REF
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates pkg-config protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git init /tmp/criu-image-streamer \
+    && cd /tmp/criu-image-streamer \
+    && git remote add origin ${CIS_REPO} \
+    && git fetch --depth 1 origin ${CIS_REF} \
+    && git checkout FETCH_HEAD \
+    && cargo build --release
+
+# =============================================================================
 # Stage: Agent - Final snapshot-agent image
 # =============================================================================
 FROM ${AGENT_BASE_IMAGE} AS agent
@@ -143,7 +168,9 @@ RUN if [ "${TARGETARCH}" != "amd64" ]; then \
       echo "ERROR: Dynamo Snapshot requires x86_64 (cuda-checkpoint has no ${TARGETARCH} binary)" >&2; exit 1; \
     fi
 
-# Install CRIU runtime dependencies
+# Install CRIU runtime dependencies + S3 streaming tooling
+# (lz4 for per-shard compression, aws-cli/s5cmd for parallel S3 transfers,
+# wget/curl for fetching the criu-image-streamer release).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libbsd0 \
     libcap2 \
@@ -160,12 +187,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tar \
     ca-certificates \
     util-linux \
+    lz4 \
+    curl \
+    wget \
+    awscli \
     && rm -rf /var/lib/apt/lists/*
+
+# Install s5cmd (parallel S3 client used by the dump/direct restore paths).
+ARG S5CMD_VERSION=2.3.0
+RUN curl -fsSL -o /tmp/s5cmd.tar.gz \
+      "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
+    && tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd \
+    && rm -f /tmp/s5cmd.tar.gz \
+    && s5cmd version
 
 # Copy CRIU from builder
 COPY --from=criu-builder /criu-install/usr/local /usr/local
 COPY --from=criu-builder /tmp/criu/COPYING /legal/CRIU/COPYING
 RUN criu --version
+
+# Install criu-image-streamer (S3 streaming dump/restore pipeline).
+COPY --from=criu-image-streamer-builder /tmp/criu-image-streamer/target/release/criu-image-streamer /usr/local/bin/criu-image-streamer
+RUN chmod +x /usr/local/bin/criu-image-streamer && criu-image-streamer --help >/dev/null
 
 # Copy CUDA checkpoint binaries
 COPY --from=criu-builder /tmp/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/local/sbin/cuda-checkpoint
@@ -203,6 +246,8 @@ RUN if [ "${TARGETARCH}" != "amd64" ]; then \
     fi
 
 # Install minimal runtime dependencies for CRIU restore (nsrestore runs here via nsenter)
+# plus S3 streaming tooling (lz4 + awscli + s5cmd) since nsrestore --checkpoint-storage-type=s3
+# executes inside this namespace.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libbsd0 \
     libcap2 \
@@ -218,7 +263,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     uuid-runtime \
     tar \
     ca-certificates \
+    lz4 \
+    curl \
+    wget \
+    awscli \
     && rm -rf /var/lib/apt/lists/*
+
+ARG S5CMD_VERSION=2.3.0
+RUN curl -fsSL -o /tmp/s5cmd.tar.gz \
+      "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_Linux-64bit.tar.gz" \
+    && tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd \
+    && rm -f /tmp/s5cmd.tar.gz \
+    && s5cmd version
+
+# Streaming pipeline binary used by nsrestore inside the placeholder namespace.
+COPY --from=criu-image-streamer-builder /tmp/criu-image-streamer/target/release/criu-image-streamer /usr/local/bin/criu-image-streamer
+RUN chmod +x /usr/local/bin/criu-image-streamer
 
 # Copy CRIU from builder (needed by nsrestore running inside these namespaces)
 COPY --from=criu-builder /criu-install/usr/local /usr/local

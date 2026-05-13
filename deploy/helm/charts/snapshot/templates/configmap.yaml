@@ -3,8 +3,11 @@
 
 apiVersion: v1
 kind: ConfigMap
-{{- if ne .Values.storage.type "pvc" }}
-{{- fail (printf "snapshot.storage.type=%q is not supported yet; only pvc is currently implemented" .Values.storage.type) }}
+{{- if not (has .Values.storage.type (list "pvc" "s3")) }}
+{{- fail (printf "snapshot.storage.type=%q is not supported; expected pvc or s3" .Values.storage.type) }}
+{{- end }}
+{{- if and (eq .Values.storage.type "s3") (eq (trimAll " " (.Values.storage.s3.uri | default "")) "") }}
+{{- fail "snapshot.storage.s3.uri is required when storage.type=s3" }}
 {{- end }}
 {{- if not (has .Values.storage.accessMode (list "agentMount" "podMount")) }}
 {{- fail (printf "snapshot.storage.accessMode=%q is not supported; expected agentMount or podMount" .Values.storage.accessMode) }}
@@ -21,6 +24,9 @@ data:
       accessMode: {{ .Values.storage.accessMode | quote }}
       {{- if eq .Values.storage.type "pvc" }}
       basePath: {{ .Values.storage.pvc.basePath | quote }}
+      {{- end }}
+      {{- if eq .Values.storage.type "s3" }}
+      s3URI: {{ .Values.storage.s3.uri | quote }}
       {{- end }}
 
     overlay:

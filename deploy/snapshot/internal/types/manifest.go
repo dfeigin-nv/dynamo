@@ -100,7 +100,17 @@ type OverlayManifest struct {
 	BindMountDests []string        `yaml:"bindMountDests,omitempty"`
 }
 
-func NewOverlayManifest(exclusions OverlaySettings, upperDir string, ociSpec *specs.Spec) OverlayManifest {
+// virtualFSTypes are filesystem types that live in the container namespace and
+// are not backed by external storage. These are excluded from BindMountDests
+// when scanning /proc/<pid>/mountinfo for OCI-managed mounts.
+var virtualFSTypes = map[string]bool{
+	"overlay": true, "proc": true, "sysfs": true, "devpts": true,
+	"tmpfs": true, "mqueue": true, "cgroup": true, "cgroup2": true,
+	"configfs": true, "debugfs": true, "hugetlbfs": true, "pstore": true,
+	"bpf": true, "tracefs": true, "securityfs": true,
+}
+
+func NewOverlayManifest(exclusions OverlaySettings, upperDir string, ociSpec *specs.Spec, mounts []MountInfo) OverlayManifest {
 	meta := OverlayManifest{
 		Exclusions: exclusions,
 		UpperDir:   upperDir,
@@ -114,11 +124,29 @@ func NewOverlayManifest(exclusions OverlaySettings, upperDir string, ociSpec *sp
 		meta.ExternalPaths = append(meta.ExternalPaths, ociSpec.Linux.MaskedPaths...)
 		meta.ExternalPaths = append(meta.ExternalPaths, ociSpec.Linux.ReadonlyPaths...)
 	}
+
+	// First pass: OCI spec bind mounts (covers standard k8s mounts like /etc/hosts).
 	for _, m := range ociSpec.Mounts {
 		if m.Type == "bind" {
 			meta.BindMountDests = append(meta.BindMountDests, m.Destination)
 		}
 	}
+
+	// Second pass: OCI-managed mounts from /proc/pid/mountinfo that are backed
+	// by real external storage (PVCs, host bind mounts). These may not appear as
+	// type="bind" in the OCI spec but must be excluded from the rootfs diff tar
+	// so we don't capture model weights or other PVC data into the checkpoint.
+	seen := make(map[string]bool, len(meta.BindMountDests))
+	for _, d := range meta.BindMountDests {
+		seen[d] = true
+	}
+	for _, m := range mounts {
+		if m.IsOCIManaged && !virtualFSTypes[m.FSType] && !seen[m.MountPoint] {
+			meta.BindMountDests = append(meta.BindMountDests, m.MountPoint)
+			seen[m.MountPoint] = true
+		}
+	}
+
 	return meta
 }
 
