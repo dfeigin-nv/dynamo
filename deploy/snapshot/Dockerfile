@@ -22,7 +22,13 @@ ARG GO_VERSION=1.25
 #   --build-arg CRIU_REPO=<git-remote-url>
 #   --build-arg CRIU_REF=<fork-branch-or-sha>
 ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
-ARG CRIU_REF=add-aio-and-parallel-memfd
+# streaming-restore-pipeline-c is add-aio-and-parallel-memfd + 8 Phase-4
+# commits adding the --stream-restore opt-in flag (memfd handover via
+# SCM_RIGHTS, UFFDIO_REGISTER_MODE_MINOR + UFFDIO_CONTINUE, PIE futex_wait).
+# Without --stream-restore, CRIU behaves identically to the base branch —
+# this lets Pipeline A continue working unchanged while Pipeline C builds
+# on the same image.
+ARG CRIU_REF=streaming-restore-pipeline-c
 
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
