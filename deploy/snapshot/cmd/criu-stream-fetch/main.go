@@ -237,11 +237,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	daemonSock, err := socketFromEnv("CRIU_STREAMER_DAEMON_SOCK")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-		os.Exit(2)
-	}
+	// Daemon socket is only needed when the dump has shmem ranges
+	// (CRIU lazy-pages with --stream-restore). Private-only dumps
+	// (e.g. a single sleep process) skip the daemon entirely.
+	daemonSock, _ := socketFromEnv("CRIU_STREAMER_DAEMON_SOCK")
 	privateSock, err := socketFromEnv("CRIU_STREAMER_PRIVATE_SOCK")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
@@ -281,10 +280,14 @@ func main() {
 	}
 
 	// Send abort_fd + eventfds to the daemon side via SCM_RIGHTS.
-	if err := sendDaemonFds(daemonSock, abortFd, shmemEvfds); err != nil {
-		fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-		poisonAbort(abortFd)
-		os.Exit(1)
+	// Skip entirely if no shmem ranges + no daemon socket inherited:
+	// private-only dumps don't run a lazy-pages daemon.
+	if daemonSock >= 0 && len(shmemEvfds) > 0 {
+		if err := sendDaemonFds(daemonSock, abortFd, shmemEvfds); err != nil {
+			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+			poisonAbort(abortFd)
+			os.Exit(1)
+		}
 	}
 
 	// Private-VMA path: one pages memfd holding all private-range bytes
@@ -316,11 +319,13 @@ func main() {
 			poisonAbort(abortFd)
 			os.Exit(1)
 		}
+		fmt.Fprintf(os.Stderr, "[stream] sending [pages_fd=%d, futex_fd=%d] to private sock %d\n", pfd, ffd, privateSock)
 		if err := sendPrivateFds(privateSock, pfd, ffd); err != nil {
 			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
 			poisonAbort(abortFd)
 			os.Exit(1)
 		}
+		fmt.Fprintf(os.Stderr, "[stream] private fds sent OK\n")
 
 		// Map the futex memfd locally so we can signal PIE.
 		raw, err := unix.Mmap(ffd, 0, futexBytes,
@@ -369,12 +374,15 @@ func main() {
 		unix.Close(shmemEvfds[i])
 	}
 
-	// Stay alive until the daemon closes the socket — abort_fd POLLHUP is
-	// the daemon's signal that everything finished cleanly. Read returns
-	// (0, nil) on stream EOF, so check n explicitly.
+	// Stay alive until the peer closes whichever socket we're using.
+	// Private-only dumps watch privateSock; shmem dumps watch daemonSock.
+	watchSock := daemonSock
+	if watchSock < 0 {
+		watchSock = privateSock
+	}
 	for {
 		var buf [1]byte
-		n, err := syscall.Read(daemonSock, buf[:])
+		n, err := syscall.Read(watchSock, buf[:])
 		if err != nil || n == 0 {
 			break
 		}
