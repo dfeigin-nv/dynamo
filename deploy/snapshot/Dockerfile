@@ -24,10 +24,6 @@ ARG GO_VERSION=1.25
 ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
 ARG CRIU_REF=add-aio-and-parallel-memfd
 
-# criu-image-streamer is the Rust binary that multiplexes CRIU image data
-# through S3 shard pipes; build it alongside CRIU from the upstream repo.
-ARG CIS_REPO=https://github.com/checkpoint-restore/criu-image-streamer.git
-ARG CIS_REF=master
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
 # For placeholder target only - this default allows agent builds to succeed,
@@ -139,25 +135,6 @@ RUN git init /tmp/criu \
 RUN git clone https://github.com/NVIDIA/cuda-checkpoint.git /tmp/cuda-checkpoint
 
 # =============================================================================
-# Stage: criu-image-streamer Builder - Rust binary used by S3 streaming dump/restore
-# =============================================================================
-FROM rust:1.82-slim AS criu-image-streamer-builder
-
-ARG CIS_REPO
-ARG CIS_REF
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      git ca-certificates pkg-config protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN git init /tmp/criu-image-streamer \
-    && cd /tmp/criu-image-streamer \
-    && git remote add origin ${CIS_REPO} \
-    && git fetch --depth 1 origin ${CIS_REF} \
-    && git checkout FETCH_HEAD \
-    && cargo build --release
-
-# =============================================================================
 # Stage: Agent - Final snapshot-agent image
 # =============================================================================
 FROM ${AGENT_BASE_IMAGE} AS agent
@@ -257,10 +234,6 @@ RUN set -eu \
 COPY --from=criu-builder /criu-install/usr/local /usr/local
 COPY --from=criu-builder /tmp/criu/COPYING /legal/CRIU/COPYING
 RUN criu --version
-
-# Install criu-image-streamer (S3 streaming dump/restore pipeline).
-COPY --from=criu-image-streamer-builder /tmp/criu-image-streamer/target/release/criu-image-streamer /usr/local/bin/criu-image-streamer
-RUN chmod +x /usr/local/bin/criu-image-streamer && criu-image-streamer --help >/dev/null
 
 # Copy CUDA checkpoint binaries
 COPY --from=criu-builder /tmp/cuda-checkpoint/bin/x86_64_Linux/cuda-checkpoint /usr/local/sbin/cuda-checkpoint
@@ -375,10 +348,6 @@ RUN set -eu \
     && /tmp/aws/install \
     && aws --version \
     && rm -rf /tmp/awscliv2.zip /tmp/awscliv2.zip.sig /tmp/aws /tmp/aws-cli.pub /root/.gnupg
-
-# Streaming pipeline binary used by nsrestore inside the placeholder namespace.
-COPY --from=criu-image-streamer-builder /tmp/criu-image-streamer/target/release/criu-image-streamer /usr/local/bin/criu-image-streamer
-RUN chmod +x /usr/local/bin/criu-image-streamer
 
 # Copy CRIU from builder (needed by nsrestore running inside these namespaces)
 COPY --from=criu-builder /criu-install/usr/local /usr/local
