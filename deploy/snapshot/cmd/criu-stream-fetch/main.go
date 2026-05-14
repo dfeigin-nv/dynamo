@@ -264,11 +264,12 @@ func main() {
 	}
 
 	// Stay alive until the daemon closes the socket — abort_fd POLLHUP is
-	// the daemon's signal that everything finished cleanly.
+	// the daemon's signal that everything finished cleanly. Read returns
+	// (0, nil) on stream EOF, so check n explicitly.
 	for {
 		var buf [1]byte
-		_, err := syscall.Read(daemonSock, buf[:])
-		if err != nil || err == io.EOF {
+		n, err := syscall.Read(daemonSock, buf[:])
+		if err != nil || n == 0 {
 			break
 		}
 	}
