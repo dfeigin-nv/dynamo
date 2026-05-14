@@ -187,6 +187,15 @@ func executeRestore(ctx context.Context, criuOpts *criurpc.CriuOpts, m *types.Ch
 // it into memfds, applies the embedded rootfs-diff and deleted-files lists,
 // and then drives CRIU restore — all in one ExecuteRestoreS3 call.
 func restoreInNamespaceS3(ctx context.Context, opts RestoreOptions, log logr.Logger) (*RestoreInNamespaceResult, error) {
+	// Pipeline C dispatch (smart-streaming restore). Gated by env so the
+	// existing PVC + S3-direct paths stay untouched. The env-only switch
+	// is deliberate while the manifest format is still bake-side
+	// (P6); once captures emit StreamMode in the manifest, the gate
+	// moves there.
+	if os.Getenv("STREAM_MODE") == "c" {
+		return restoreInNamespacePipelineC(ctx, opts, log)
+	}
+
 	if opts.CheckpointLocation == "" {
 		return nil, fmt.Errorf("S3 restore requires --checkpoint-location (s3:// prefix)")
 	}

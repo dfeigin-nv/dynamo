@@ -81,6 +81,7 @@ ARG TARGETARCH=amd64
 
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-w -s" -o /snapshot-agent ./cmd/agent
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-w -s" -o /nsrestore ./cmd/nsrestore
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-w -s" -o /criu-stream-fetch ./cmd/criu-stream-fetch
 
 # =============================================================================
 # Stage: CUDA checkpoint helper builder
@@ -369,6 +370,10 @@ RUN chmod +x /usr/local/sbin/cuda-checkpoint /usr/local/bin/cuda-checkpoint-help
 # Copy nsrestore binary (invoked by DaemonSet via nsenter)
 COPY --from=builder /nsrestore /usr/local/bin/nsrestore
 RUN chmod +x /usr/local/bin/nsrestore
+
+# Copy Pipeline C streamer (spawned by nsrestore when STREAM_MODE=c).
+COPY --from=builder /criu-stream-fetch /usr/local/sbin/criu-stream-fetch
+RUN chmod +x /usr/local/sbin/criu-stream-fetch
 
 # Create directories
 RUN mkdir -p /checkpoints /var/run/criu /var/criu-work
