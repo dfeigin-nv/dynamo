@@ -277,49 +277,68 @@ func main() {
 		}
 	}
 
-	// Private-VMA path: one pages memfd holding all private-range bytes
-	// at the offsets pagemap_render_iovec computed. CRIU waits for
-	// a 1-byte 'A' ack on the same socket before letting PIE run, so
-	// the wire is: SCM_RIGHTS(pages_memfd) -> fill -> 'A'.
+	// Private-VMA path: request-response over the private socket.
+	// CRIU writes a 4-byte uint32 pages_img_id; streamer replies with
+	// SCM_RIGHTS(memfd) for that id plus a 1-byte 'A' ack after the
+	// memfd has been fully filled. Loop until CRIU closes the socket.
 	if len(m.PrivateRanges) > 0 {
-		var pagesSize uint64
-		for _, r := range m.PrivateRanges {
-			pagesSize += r.Size
-		}
-		pfd, err := memfdCreate("criu-private-pages", pagesSize)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-			poisonAbort(abortFd)
-			os.Exit(1)
-		}
-		fmt.Fprintf(os.Stderr, "[stream] sending pages_fd=%d to private sock %d\n", pfd, privateSock)
-		if err := sendPrivateFd(privateSock, pfd); err != nil {
-			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-			poisonAbort(abortFd)
-			os.Exit(1)
+		// Index manifest entries by id for O(1) lookup.
+		byID := make(map[uint32]*rangeEntry, len(m.PrivateRanges))
+		for i := range m.PrivateRanges {
+			byID[m.PrivateRanges[i].ID] = &m.PrivateRanges[i]
 		}
 
-		// Local-files smoke: fill pages memfd from concatenated
-		// sources at file-offset boundaries. The real (S3) variant
-		// fills the same memfd via NIXL OBJ posts; the ack contract
-		// is unchanged.
-		var off int64
-		for i, r := range m.PrivateRanges {
-			if err := copyFileToFdAt(pfd, off, r.Source); err != nil {
-				fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill private %d: %v\n", i, err)
+		for {
+			var hdr [4]byte
+			n, err := unix.Read(privateSock, hdr[:])
+			if n == 0 || err == io.EOF {
+				break // CRIU closed; no more tasks
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: read id: %v\n", err)
 				poisonAbort(abortFd)
 				os.Exit(1)
 			}
-			off += int64(r.Size)
-		}
+			if n != 4 {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: short id read: %d\n", n)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+			id := binary.NativeEndian.Uint32(hdr[:])
+			r := byID[id]
+			if r == nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: manifest missing pages_img_id=%u\n", id)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
 
-		if err := sendPrivateAck(privateSock); err != nil {
-			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-			poisonAbort(abortFd)
-			os.Exit(1)
+			pfd, err := memfdCreate(fmt.Sprintf("criu-private-%d", id), r.Size)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "[stream] id=%d size=%d src=%s\n",
+				id, r.Size, r.Source)
+
+			if err := sendPrivateFd(privateSock, pfd); err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+			if err := copyFileToFdAt(pfd, 0, r.Source); err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill id=%d: %v\n", id, err)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+			if err := sendPrivateAck(privateSock); err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+			unix.Close(pfd)
 		}
-		fmt.Fprintf(os.Stderr, "[stream] private fill done + acked\n")
-		unix.Close(pfd)
+		fmt.Fprintf(os.Stderr, "[stream] private loop done\n")
 	}
 
 	// Fill each shmem memfd, signal its eventfd as the last byte lands.
