@@ -109,6 +109,10 @@ FROM ubuntu:24.04 AS criu-builder
 
 ARG CRIU_REPO
 ARG CRIU_REF
+# Pass --build-arg CRIU_CACHE_BUST=$(date +%s) to force a fresh git fetch
+# when the upstream branch has new commits but ${CRIU_REF} string is
+# unchanged.
+ARG CRIU_CACHE_BUST=2
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -131,11 +135,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     uuid-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git init /tmp/criu \
+RUN echo "criu cache-bust: ${CRIU_CACHE_BUST}" \
+    && git init /tmp/criu \
     && cd /tmp/criu \
     && git remote add origin ${CRIU_REPO} \
     && git fetch --depth 1 origin ${CRIU_REF} \
     && git checkout FETCH_HEAD \
+    && git --no-pager log --oneline -3 \
     && make -j$(nproc) \
     && make DESTDIR=/criu-install install-criu install-lib install-cuda_plugin
 
@@ -251,6 +257,8 @@ RUN chmod +x /usr/local/sbin/cuda-checkpoint /usr/local/bin/cuda-checkpoint-help
 # Copy the built binaries
 COPY --from=builder /snapshot-agent /usr/local/bin/snapshot-agent
 COPY --from=builder /nsrestore /usr/local/bin/nsrestore
+COPY --from=builder /criu-stream-fetch /usr/local/sbin/criu-stream-fetch
+RUN chmod +x /usr/local/sbin/criu-stream-fetch
 
 # Create directories
 RUN mkdir -p /checkpoints /var/run/snapshot
