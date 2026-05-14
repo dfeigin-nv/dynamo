@@ -105,13 +105,18 @@ func startS3DownloadPipes(s3URI, hash string, numShards int) ([]*os.File, []*exe
 			return nil, nil, "", fmt.Errorf("failed to create shard %d pipe: %w", i, err)
 		}
 
+		// -c 32 matches the existing direct.go cp path and lifts s5cmd cat
+		// off its default 5 parallel range-GETs per shard. With 16 shards
+		// outer × 32 inner that's 512 concurrent parts in flight, well
+		// within s5cmd's --numworkers (default 256 per process) and the
+		// ~400 Gbps host fabric headroom on p4d-class instances.
 		var s3Key, shellCmd string
 		if useLZ4 {
 			s3Key = fmt.Sprintf("%s/%s/img-%d.lz4", s3URI, hash, i)
-			shellCmd = fmt.Sprintf("s5cmd cat '%s' | lz4 -d - -", s3Key)
+			shellCmd = fmt.Sprintf("s5cmd cat -c 32 '%s' | lz4 -d - -", s3Key)
 		} else {
 			s3Key = fmt.Sprintf("%s/%s/img-%d", s3URI, hash, i)
-			shellCmd = fmt.Sprintf("s5cmd cat '%s'", s3Key)
+			shellCmd = fmt.Sprintf("s5cmd cat -c 32 '%s'", s3Key)
 		}
 		cmd := exec.Command("sh", "-c", shellCmd)
 		cmd.Stdout = w

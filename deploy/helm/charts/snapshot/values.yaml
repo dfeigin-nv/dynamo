@@ -71,13 +71,18 @@ storage:
 
   # S3 backend configuration (when type=s3).
   # Required: uri is the bucket+prefix root (e.g. s3://my-bucket/checkpoints).
-  # Per-checkpoint shards land at <uri>/<checkpointID>/versions/<v>/img-*.lz4.
+  # Per-checkpoint shards land at <uri>/<checkpointID>/versions/<v>/img-*(.lz4).
   # credentialsSecretRef references a Secret with AWS_ACCESS_KEY_ID /
   # AWS_SECRET_ACCESS_KEY / AWS_REGION (or IRSA equivalents) — daemonset.yaml
   # mounts it as envFrom on the agent container.
+  # shardLZ4 toggles per-shard lz4 compression. false (default) ships raw
+  # CRIU image bytes and surfaces shards as img-* (no .lz4 suffix). true
+  # enables lz4. The agent reads S3_SHARD_LZ4 at runtime; the daemonset
+  # template wires it from this value.
   s3:
     uri: ""
     credentialsSecretRef: ""
+    shardLZ4: false
 
   # Reserved for future snapshot-owned backends. Unsupported today.
   oci:
