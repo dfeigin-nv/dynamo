@@ -113,8 +113,18 @@ spec:
             - name: SNAPSHOT_LOG_LEVEL
               value: {{ .Values.daemonset.snapshotLogLevel | quote }}
             {{- if eq .Values.storage.type "s3" }}
+            # S3_DIRECT routes the dump/restore between two S3 paths:
+            #   "1" — direct path (internal/criu/streams3/direct.go): s5cmd
+            #         copies individual checkpoint files into a tmpfs at
+            #         /run/criu-s3-images and CRIU reads regular files.
+            #   "0" — streaming path (internal/criu/streams3/stream.go):
+            #         criu-image-streamer pipes shards through s5cmd cat.
+            # Gate at internal/executor/{checkpoint.go:369,nsrestore.go:219}.
+            - name: S3_DIRECT
+              value: {{ ternary "1" "0" (default true .Values.storage.s3.directMode) | quote }}
             # S3_SHARD_LZ4 gates lz4 on the dump/restore pipe in
             # internal/criu/streams3/pipes.go ("!= 0" means enable).
+            # Only consulted on the streaming path (S3_DIRECT=0).
             - name: S3_SHARD_LZ4
               value: {{ ternary "1" "0" .Values.storage.s3.shardLZ4 | quote }}
             {{- end }}

@@ -78,11 +78,23 @@ storage:
   # shardLZ4 toggles per-shard lz4 compression. false (default) ships raw
   # CRIU image bytes and surfaces shards as img-* (no .lz4 suffix). true
   # enables lz4. The agent reads S3_SHARD_LZ4 at runtime; the daemonset
-  # template wires it from this value.
+  # template wires it from this value. Only consulted on the streaming
+  # path (storage.s3.directMode=false).
+  #
+  # directMode picks between the two S3 dump/restore implementations:
+  #   true  (default) — direct path: s5cmd materializes per-file checkpoint
+  #                     objects into a tmpfs at /run/criu-s3-images and CRIU
+  #                     reads regular files. Architecturally correct path.
+  #   false           — streaming path: criu-image-streamer pipes sharded
+  #                     stdio through s5cmd cat. Kept as a debug fallback.
+  # The agent reads the S3_DIRECT env var at runtime; the daemonset template
+  # wires it from this value (see Gate at internal/executor/checkpoint.go:369
+  # and nsrestore.go:219).
   s3:
     uri: ""
     credentialsSecretRef: ""
     shardLZ4: false
+    directMode: true
 
   # Reserved for future snapshot-owned backends. Unsupported today.
   oci:
