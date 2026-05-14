@@ -146,15 +146,15 @@ func main() {
 	}
 	fmt.Printf("[ok] daemon recv %d fds (abort + %d eventfds)\n", len(fds), n)
 
-	// 3. Private socket: 1 memfd.
-	pfds := make([]int, 0, 1)
-	if err := recvFds(privatePair[0], 1, &pfds); err != nil {
-		die("private recv fd: %v", err)
+	// 3. Private socket: [pages_memfd, futex_memfd].
+	pfds := make([]int, 0, 2)
+	if err := recvFds(privatePair[0], 2, &pfds); err != nil {
+		die("private recv fds: %v", err)
 	}
-	if len(pfds) != 1 {
-		die("private fd count: got %d, want 1", len(pfds))
+	if len(pfds) != 2 {
+		die("private fd count: got %d, want 2", len(pfds))
 	}
-	fmt.Printf("[ok] private recv 1 memfd\n")
+	fmt.Printf("[ok] private recv 2 fds (pages + futex)\n")
 
 	// Drain remaining bytes (streamer fills shmem memfds then loops on
 	// the daemon socket; closing our end signals shutdown).
