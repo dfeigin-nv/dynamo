@@ -3,17 +3,114 @@ package criu
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	criulib "github.com/checkpoint-restore/go-criu/v8"
 	criurpc "github.com/checkpoint-restore/go-criu/v8/rpc"
 	"github.com/go-logr/logr"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/logging"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
 )
+
+// writePipelineCManifest walks checkpointPath for pages-*.img files and
+// emits a streamer-compatible JSON manifest at <workDir>/pipeline-c-
+// manifest.json. Each entry is one pages_img_id with the on-disk path
+// as source. Returns the manifest path.
+func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
+	entries, err := os.ReadDir(checkpointPath)
+	if err != nil {
+		return "", fmt.Errorf("readdir %s: %w", checkpointPath, err)
+	}
+	type rangeEntry struct {
+		ID     uint32 `json:"id"`
+		Size   uint64 `json:"size"`
+		Source string `json:"source"`
+	}
+	var priv []rangeEntry
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "pages-") || !strings.HasSuffix(name, ".img") {
+			continue
+		}
+		idStr := strings.TrimSuffix(strings.TrimPrefix(name, "pages-"), ".img")
+		var id uint32
+		if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+			continue
+		}
+		src := filepath.Join(checkpointPath, name)
+		info, err := os.Stat(src)
+		if err != nil {
+			return "", fmt.Errorf("stat %s: %w", src, err)
+		}
+		priv = append(priv, rangeEntry{ID: id, Size: uint64(info.Size()), Source: src})
+	}
+	if workDir == "" {
+		workDir = checkpointPath
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return "", err
+	}
+	out := filepath.Join(workDir, "pipeline-c-manifest.json")
+	body := []byte(`{"shmem_ranges":[],"private_ranges":[`)
+	first := true
+	for _, r := range priv {
+		if !first {
+			body = append(body, ',')
+		}
+		first = false
+		body = append(body, []byte(fmt.Sprintf(
+			`{"id":%d,"size":%d,"source":%q}`, r.ID, r.Size, r.Source))...)
+	}
+	body = append(body, []byte("]}")...)
+	if err := os.WriteFile(out, body, 0o644); err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// spawnPipelineCStreamer forks the criu-stream-fetch binary with one end
+// of a Unix SOCK_STREAM socketpair attached as inherited fd 3, and
+// returns the swrk-side end for go-criu to pass to the spawned CRIU.
+//
+// Streamer fd 3 (its private socket end) is non-CLOEXEC so it survives
+// exec; the swrk end has CLOEXEC stripped only on the way into criu
+// (handled by go-criu's ExtraFiles plumbing).
+func spawnPipelineCStreamer(manifest string, log logr.Logger) (*exec.Cmd, *os.File, error) {
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("socketpair: %w", err)
+	}
+	streamerEnd := os.NewFile(uintptr(pair[0]), "stream-priv-streamer")
+	swrkEnd := os.NewFile(uintptr(pair[1]), "stream-priv-swrk")
+
+	const streamerBin = "/usr/local/sbin/criu-stream-fetch"
+	if _, err := os.Stat(streamerBin); err != nil {
+		streamerEnd.Close()
+		swrkEnd.Close()
+		return nil, nil, fmt.Errorf("streamer binary missing: %w", err)
+	}
+
+	cmd := exec.Command(streamerBin, "--manifest", manifest)
+	cmd.Env = append(os.Environ(), "CRIU_STREAMER_PRIVATE_SOCK=3")
+	cmd.ExtraFiles = []*os.File{streamerEnd}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		streamerEnd.Close()
+		swrkEnd.Close()
+		return nil, nil, fmt.Errorf("start streamer: %w", err)
+	}
+	streamerEnd.Close() // parent's copy; child has the inherited fd 3
+	log.Info("Pipeline C streamer started",
+		"pid", cmd.Process.Pid, "manifest", manifest)
+	return cmd, swrkEnd, nil
+}
 
 // RestoreLogFilename is the CRIU restore log filename (also used by executor/restore.go).
 const RestoreLogFilename = "restore.log"
@@ -101,8 +198,33 @@ func ExecuteRestore(
 	inheritedFiles := registerInheritFDs(c, m.K8s.StdioFDs, log)
 	defer closeFiles(inheritedFiles)
 
+	// Pipeline C: auto-generate streamer manifest from the local CRIU
+	// images directory, spawn the streamer, hand its swrk-side socket
+	// end to go-criu. Setup runs inside the placeholder namespace so
+	// cross-ns fd passing is unnecessary.
+	var streamer *exec.Cmd
+	if criuOpts.GetStreamRestore() {
+		manifest, err := writePipelineCManifest(checkpointPath, settings.WorkDir)
+		if err != nil {
+			return 0, fmt.Errorf("Pipeline C manifest: %w", err)
+		}
+		s, sockSwrk, err := spawnPipelineCStreamer(manifest, log)
+		if err != nil {
+			return 0, fmt.Errorf("Pipeline C streamer spawn: %w", err)
+		}
+		streamer = s
+		defer func() {
+			if streamer != nil && streamer.ProcessState == nil {
+				_ = streamer.Process.Signal(syscall.SIGTERM)
+				_, _ = streamer.Process.Wait()
+			}
+		}()
+		c.SetStreamPrivateSock(sockSwrk)
+		defer sockSwrk.Close()
+	}
+
 	notify := &restoreNotify{log: log}
-	log.V(1).Info("Executing go-criu Restore call")
+	log.V(1).Info("Executing go-criu Restore call", "stream_restore", criuOpts.GetStreamRestore())
 	if err := c.Restore(criuOpts, notify); err != nil {
 		log.Error(err, "go-criu Restore returned error")
 		logging.LogRestoreErrors(checkpointPath, settings.WorkDir, log)
@@ -134,6 +256,14 @@ func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroup
 	// Restore-only options
 	criuOpts.RstSibling = proto.Bool(settings.RstSibling)
 	criuOpts.MntnsCompatMode = proto.Bool(settings.MntnsCompatMode)
+
+	// Pipeline C opt-in via env. When STREAM_MODE=c the agent's
+	// ExecuteRestore will spawn the streamer + hand its socket to
+	// go-criu, and the swrk-mode CRIU's mem.c will recv per-task
+	// pages memfds via the protocol installed in cr_restore_tasks.
+	if os.Getenv("STREAM_MODE") == "c" {
+		criuOpts.StreamRestore = proto.Bool(true)
+	}
 	criuOpts.EvasiveDevices = proto.Bool(settings.EvasiveDevices)
 	criuOpts.ForceIrmap = proto.Bool(settings.ForceIrmap)
 

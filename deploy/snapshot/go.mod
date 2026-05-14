@@ -118,4 +118,4 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.1 // indirect
 )
 
-replace github.com/checkpoint-restore/go-criu/v8 => github.com/dfeigin-nv/go-criu/v8 v8.1.1-0.20260513104954-af0384c22de8
+replace github.com/checkpoint-restore/go-criu/v8 => github.com/dfeigin-nv/go-criu/v8 v8.1.1-0.20260514180421-228096b63c22
