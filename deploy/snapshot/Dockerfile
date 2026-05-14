@@ -169,8 +169,11 @@ RUN if [ "${TARGETARCH}" != "amd64" ]; then \
     fi
 
 # Install CRIU runtime dependencies + S3 streaming tooling
-# (lz4 for per-shard compression, aws-cli/s5cmd for parallel S3 transfers,
-# wget/curl for fetching the criu-image-streamer release).
+# (lz4 for per-shard compression, s5cmd for parallel S3 transfers,
+# wget/curl for fetching tarballs, unzip+gnupg for the AWS CLI v2 bundled
+# installer + signature verification).
+# NOTE: the apt package `awscli` is not in Ubuntu 24.04 noble universe,
+# so AWS CLI v2 is installed below from the official bundled installer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libbsd0 \
     libcap2 \
@@ -190,7 +193,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lz4 \
     curl \
     wget \
-    awscli \
+    unzip \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # Install s5cmd (parallel S3 client used by the dump/direct restore paths).
@@ -200,6 +204,54 @@ RUN curl -fsSL -o /tmp/s5cmd.tar.gz \
     && tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd \
     && rm -f /tmp/s5cmd.tar.gz \
     && s5cmd version
+
+# Install AWS CLI v2 from the official bundled installer, with GPG signature
+# verification against the AWS CLI Team public key (key ID A6310ACC4672475C,
+# fingerprint FB5DB77FD5C118B80511ADA8A6310ACC4672475C, valid through 2026-07).
+# Versioned URL is used so builds are reproducible; bump AWSCLI_VERSION when
+# upgrading. See https://docs.aws.amazon.com/cli/latest/userguide/getting-started-version.html
+ARG AWSCLI_VERSION=2.34.46
+RUN set -eu \
+    && cat > /tmp/aws-cli.pub <<'EOF'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBF2Cr7UBEADJZHcgusOJl7ENSyumXh85z0TRV0xJorM2B/JL0kHOyigQluUG
+ZMLhENaG0bYatdrKP+3H91lvK050pXwnO/R7fB/FSTouki4ciIx5OuLlnJZIxSzx
+PqGl0mkxImLNbGWoi6Lto0LYxqHN2iQtzlwTVmq9733zd3XfcXrZ3+LblHAgEt5G
+TfNxEKJ8soPLyWmwDH6HWCnjZ/aIQRBTIQ05uVeEoYxSh6wOai7ss/KveoSNBbYz
+gbdzoqI2Y8cgH2nbfgp3DSasaLZEdCSsIsK1u05CinE7k2qZ7KgKAUIcT/cR/grk
+C6VwsnDU0OUCideXcQ8WeHutqvgZH1JgKDbznoIzeQHJD238GEu+eKhRHcz8/jeG
+94zkcgJOz3KbZGYMiTh277Fvj9zzvZsbMBCedV1BTg3TqgvdX4bdkhf5cH+7NtWO
+lrFj6UwAsGukBTAOxC0l/dnSmZhJ7Z1KmEWilro/gOrjtOxqRQutlIqG22TaqoPG
+fYVN+en3Zwbt97kcgZDwqbuykNt64oZWc4XKCa3mprEGC3IbJTBFqglXmZ7l9ywG
+EEUJYOlb2XrSuPWml39beWdKM8kzr1OjnlOm6+lpTRCBfo0wa9F8YZRhHPAkwKkX
+XDeOGpWRj4ohOx0d2GWkyV5xyN14p2tQOCdOODmz80yUTgRpPVQUtOEhXQARAQAB
+tCFBV1MgQ0xJIFRlYW0gPGF3cy1jbGlAYW1hem9uLmNvbT6JAlQEEwEIAD4CGwMF
+CwkIBwIGFQoJCAsCBBYCAwECHgECF4AWIQT7Xbd/1cEYuAURraimMQrMRnJHXAUC
+aGveYQUJDMpiLAAKCRCmMQrMRnJHXKBYD/9Ab0qQdGiO5hObchG8xh8Rpb4Mjyf6
+0JrVo6m8GNjNj6BHkSc8fuTQJ/FaEhaQxj3pjZ3GXPrXjIIVChmICLlFuRXYzrXc
+Pw0lniybypsZEVai5kO0tCNBCCFuMN9RsmmRG8mf7lC4FSTbUDmxG/QlYK+0IV/l
+uJkzxWa+rySkdpm0JdqumjegNRgObdXHAQDWlubWQHWyZyIQ2B4U7AxqSpcdJp6I
+S4Zds4wVLd1WE5pquYQ8vS2cNlDm4QNg8wTj58e3lKN47hXHMIb6CHxRnb947oJa
+pg189LLPR5koh+EorNkA1wu5mAJtJvy5YMsppy2y/kIjp3lyY6AmPT1posgGk70Z
+CmToEZ5rbd7ARExtlh76A0cabMDFlEHDIK8RNUOSRr7L64+KxOUegKBfQHb9dADY
+qqiKqpCbKgvtWlds909Ms74JBgr2KwZCSY1HaOxnIr4CY43QRqAq5YHOay/mU+6w
+hhmdF18vpyK0vfkvvGresWtSXbag7Hkt3XjaEw76BzxQH21EBDqU8WJVjHgU6ru+
+DJTs+SxgJbaT3hb/vyjlw0lK+hFfhWKRwgOXH8vqducF95NRSUxtS4fpqxWVaw3Q
+V2OWSjbne99A5EPEySzryFTKbMGwaTlAwMCwYevt4YT6eb7NmFhTx0Fis4TalUs+
+j+c7Kg92pDx2uQ==
+=OBAt
+-----END PGP PUBLIC KEY BLOCK-----
+EOF
+RUN set -eu \
+    && gpg --import /tmp/aws-cli.pub \
+    && curl -fsSL -o /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip" \
+    && curl -fsSL -o /tmp/awscliv2.zip.sig "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip.sig" \
+    && gpg --verify /tmp/awscliv2.zip.sig /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && aws --version \
+    && rm -rf /tmp/awscliv2.zip /tmp/awscliv2.zip.sig /tmp/aws /tmp/aws-cli.pub /root/.gnupg
 
 # Copy CRIU from builder
 COPY --from=criu-builder /criu-install/usr/local /usr/local
@@ -246,8 +298,10 @@ RUN if [ "${TARGETARCH}" != "amd64" ]; then \
     fi
 
 # Install minimal runtime dependencies for CRIU restore (nsrestore runs here via nsenter)
-# plus S3 streaming tooling (lz4 + awscli + s5cmd) since nsrestore --checkpoint-storage-type=s3
-# executes inside this namespace.
+# plus S3 streaming tooling (lz4 + s5cmd + AWS CLI v2) since
+# nsrestore --checkpoint-storage-type=s3 executes inside this namespace.
+# unzip+gnupg are required by the AWS CLI v2 bundled installer + sig verify
+# (see agent stage above for rationale).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libbsd0 \
     libcap2 \
@@ -266,7 +320,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lz4 \
     curl \
     wget \
-    awscli \
+    unzip \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 ARG S5CMD_VERSION=2.3.0
@@ -275,6 +330,51 @@ RUN curl -fsSL -o /tmp/s5cmd.tar.gz \
     && tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd \
     && rm -f /tmp/s5cmd.tar.gz \
     && s5cmd version
+
+# Install AWS CLI v2 from the official bundled installer with GPG sig verify
+# (same approach + key block as the agent stage above).
+ARG AWSCLI_VERSION=2.34.46
+RUN set -eu \
+    && cat > /tmp/aws-cli.pub <<'EOF'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBF2Cr7UBEADJZHcgusOJl7ENSyumXh85z0TRV0xJorM2B/JL0kHOyigQluUG
+ZMLhENaG0bYatdrKP+3H91lvK050pXwnO/R7fB/FSTouki4ciIx5OuLlnJZIxSzx
+PqGl0mkxImLNbGWoi6Lto0LYxqHN2iQtzlwTVmq9733zd3XfcXrZ3+LblHAgEt5G
+TfNxEKJ8soPLyWmwDH6HWCnjZ/aIQRBTIQ05uVeEoYxSh6wOai7ss/KveoSNBbYz
+gbdzoqI2Y8cgH2nbfgp3DSasaLZEdCSsIsK1u05CinE7k2qZ7KgKAUIcT/cR/grk
+C6VwsnDU0OUCideXcQ8WeHutqvgZH1JgKDbznoIzeQHJD238GEu+eKhRHcz8/jeG
+94zkcgJOz3KbZGYMiTh277Fvj9zzvZsbMBCedV1BTg3TqgvdX4bdkhf5cH+7NtWO
+lrFj6UwAsGukBTAOxC0l/dnSmZhJ7Z1KmEWilro/gOrjtOxqRQutlIqG22TaqoPG
+fYVN+en3Zwbt97kcgZDwqbuykNt64oZWc4XKCa3mprEGC3IbJTBFqglXmZ7l9ywG
+EEUJYOlb2XrSuPWml39beWdKM8kzr1OjnlOm6+lpTRCBfo0wa9F8YZRhHPAkwKkX
+XDeOGpWRj4ohOx0d2GWkyV5xyN14p2tQOCdOODmz80yUTgRpPVQUtOEhXQARAQAB
+tCFBV1MgQ0xJIFRlYW0gPGF3cy1jbGlAYW1hem9uLmNvbT6JAlQEEwEIAD4CGwMF
+CwkIBwIGFQoJCAsCBBYCAwECHgECF4AWIQT7Xbd/1cEYuAURraimMQrMRnJHXAUC
+aGveYQUJDMpiLAAKCRCmMQrMRnJHXKBYD/9Ab0qQdGiO5hObchG8xh8Rpb4Mjyf6
+0JrVo6m8GNjNj6BHkSc8fuTQJ/FaEhaQxj3pjZ3GXPrXjIIVChmICLlFuRXYzrXc
+Pw0lniybypsZEVai5kO0tCNBCCFuMN9RsmmRG8mf7lC4FSTbUDmxG/QlYK+0IV/l
+uJkzxWa+rySkdpm0JdqumjegNRgObdXHAQDWlubWQHWyZyIQ2B4U7AxqSpcdJp6I
+S4Zds4wVLd1WE5pquYQ8vS2cNlDm4QNg8wTj58e3lKN47hXHMIb6CHxRnb947oJa
+pg189LLPR5koh+EorNkA1wu5mAJtJvy5YMsppy2y/kIjp3lyY6AmPT1posgGk70Z
+CmToEZ5rbd7ARExtlh76A0cabMDFlEHDIK8RNUOSRr7L64+KxOUegKBfQHb9dADY
+qqiKqpCbKgvtWlds909Ms74JBgr2KwZCSY1HaOxnIr4CY43QRqAq5YHOay/mU+6w
+hhmdF18vpyK0vfkvvGresWtSXbag7Hkt3XjaEw76BzxQH21EBDqU8WJVjHgU6ru+
+DJTs+SxgJbaT3hb/vyjlw0lK+hFfhWKRwgOXH8vqducF95NRSUxtS4fpqxWVaw3Q
+V2OWSjbne99A5EPEySzryFTKbMGwaTlAwMCwYevt4YT6eb7NmFhTx0Fis4TalUs+
+j+c7Kg92pDx2uQ==
+=OBAt
+-----END PGP PUBLIC KEY BLOCK-----
+EOF
+RUN set -eu \
+    && gpg --import /tmp/aws-cli.pub \
+    && curl -fsSL -o /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip" \
+    && curl -fsSL -o /tmp/awscliv2.zip.sig "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip.sig" \
+    && gpg --verify /tmp/awscliv2.zip.sig /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && aws --version \
+    && rm -rf /tmp/awscliv2.zip /tmp/awscliv2.zip.sig /tmp/aws /tmp/aws-cli.pub /root/.gnupg
 
 # Streaming pipeline binary used by nsrestore inside the placeholder namespace.
 COPY --from=criu-image-streamer-builder /tmp/criu-image-streamer/target/release/criu-image-streamer /usr/local/bin/criu-image-streamer
