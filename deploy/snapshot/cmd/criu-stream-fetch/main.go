@@ -31,7 +31,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -101,12 +103,36 @@ func sendDaemonFds(sock int, abortFd int, evfds []int) error {
 	return nil
 }
 
-// sendPrivateFd sends one memfd over the per-task private-pages socket.
-// Matches criu/mem.c:recv_streamer_private_fd (single fd, no payload).
-func sendPrivateFd(sock int, memfd int) error {
-	rights := unix.UnixRights(memfd)
+// sendPrivateFds sends [pages_memfd, futex_memfd] over the per-task
+// private-pages socket as a single SCM_RIGHTS message with a 1-byte
+// dummy iov. Matches criu/mem.c:recv_streamer_private_fds, which calls
+// __recv_fds(sock, fds, 2, NULL, 0).
+func sendPrivateFds(sock, pagesFd, futexFd int) error {
+	rights := unix.UnixRights(pagesFd, futexFd)
 	if err := unix.Sendmsg(sock, []byte{0}, rights, nil, 0); err != nil {
-		return fmt.Errorf("sendmsg private fd: %w", err)
+		return fmt.Errorf("sendmsg private fds: %w", err)
+	}
+	return nil
+}
+
+// signalFutexReady writes 1 to futex[idx] (MAP_SHARED with PIE) and
+// futex-wakes any waiter. PIE's restorer.c:1895 path is
+//   while (!ready) sys_futex(FUTEX_WAIT)
+// so the write-then-wake matches a standard producer side.
+func signalFutexReady(futex []uint32, idx int) error {
+	if idx >= len(futex) {
+		return fmt.Errorf("futex idx %d out of range %d", idx, len(futex))
+	}
+	// Atomic store-release before wake.
+	atomicStore32(&futex[idx], 1)
+	addr := uintptr(unsafe.Pointer(&futex[idx]))
+	// FUTEX_WAKE = 1; not exposed in x/sys/unix on this version, so
+	// pass the raw op code. Wake up to INT_MAX waiters.
+	const futexWake = 1
+	_, _, errno := unix.Syscall6(unix.SYS_FUTEX, addr,
+		futexWake, 0x7fffffff, 0, 0, 0)
+	if errno != 0 {
+		return fmt.Errorf("futex_wake idx %d: %v", idx, errno)
 	}
 	return nil
 }
@@ -120,9 +146,51 @@ func fillMemfd(memfd int, source string) error {
 		return err
 	}
 	defer src.Close()
+	// Wrap the fd in *os.File for io.Copy; do NOT defer dst.Close() —
+	// the caller continues to use memfd by raw fd. We seek to 0 and
+	// io.Copy advances via Write which uses the memfd's offset; that's
+	// fine for sequential fill, but if the caller does later writes
+	// they must seek themselves.
 	dst := os.NewFile(uintptr(memfd), "memfd")
 	_, err = io.Copy(dst, src)
 	return err
+}
+
+// copyFileToFdAt writes source's bytes into memfd starting at offset
+// off (pwrite-style). Used for the aggregate private-pages memfd where
+// each range lands at a distinct offset.
+func copyFileToFdAt(memfd int, off int64, source string) error {
+	src, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	buf := make([]byte, 64*1024)
+	cur := off
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			w, werr := unix.Pwrite(memfd, buf[:n], cur)
+			if werr != nil {
+				return werr
+			}
+			if w != n {
+				return fmt.Errorf("short pwrite at %d: got %d want %d", cur, w, n)
+			}
+			cur += int64(n)
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+}
+
+// atomicStore32 store-releases v into *p. Used right before FUTEX_WAKE.
+func atomicStore32(p *uint32, v uint32) {
+	atomic.StoreUint32(p, v)
 }
 
 // signalReady writes 1 to the eventfd; daemon's handle_streamer_evfd
@@ -219,31 +287,69 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Send the (single) private-VMA memfd to the restore side. Multi-task
-	// fan-out lives in a follow-on once we have >1 task in real workloads.
+	// Private-VMA path: one pages memfd holding all private-range bytes
+	// at the offsets pagemap_render_iovec computed, plus a futex memfd
+	// sized n_private*sizeof(uint32) that PIE futex-waits on per range.
+	// Multi-task fan-out is a follow-on once we have >1 task.
+	var futex []uint32
+	var futexBytes int
 	if len(m.PrivateRanges) > 0 {
-		pfd, err := memfdCreate("criu-private-0", m.PrivateRanges[0].Size)
+		nPriv := len(m.PrivateRanges)
+		futexBytes = nPriv * 4
+
+		// Aggregate pages memfd: sum the range sizes for now. Real
+		// agent will size this to CRIU's vma_ios layout from the
+		// manifest CRIU sees.
+		var pagesSize uint64
+		for _, r := range m.PrivateRanges {
+			pagesSize += r.Size
+		}
+		pfd, err := memfdCreate("criu-private-pages", pagesSize)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
 			poisonAbort(abortFd)
 			os.Exit(1)
 		}
-		if err := sendPrivateFd(privateSock, pfd); err != nil {
+		ffd, err := memfdCreate("criu-private-futex", uint64(futexBytes))
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
 			poisonAbort(abortFd)
 			os.Exit(1)
 		}
-		// Fill the private memfd from its source file. PIE waits on its
-		// per-task streamer_private_ready_futex; we'll wire that signal
-		// once the agent passes the shmalloc'd futex array address
-		// through; for the smoke the PIE side falls back to the
-		// existing pages-img path when the futex pointer is NULL.
-		if err := fillMemfd(pfd, m.PrivateRanges[0].Source); err != nil {
-			fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill private: %v\n", err)
+		if err := sendPrivateFds(privateSock, pfd, ffd); err != nil {
+			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
 			poisonAbort(abortFd)
 			os.Exit(1)
 		}
+
+		// Map the futex memfd locally so we can signal PIE.
+		raw, err := unix.Mmap(ffd, 0, futexBytes,
+			unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "criu-stream-fetch: mmap futex: %v\n", err)
+			poisonAbort(abortFd)
+			os.Exit(1)
+		}
+		futex = unsafe.Slice((*uint32)(unsafe.Pointer(&raw[0])), nPriv)
+
+		// Local-files smoke: fill pages memfd from concatenated
+		// sources. Real version reads from S3 per-range via NIXL.
+		var off int64
+		for i, r := range m.PrivateRanges {
+			if err := copyFileToFdAt(pfd, off, r.Source); err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill private %d: %v\n", i, err)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+			off += int64(r.Size)
+			if err := signalFutexReady(futex, i); err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+		}
 		unix.Close(pfd)
+		unix.Close(ffd)
 	}
 
 	// Fill each shmem memfd, signal its eventfd as the last byte lands.
