@@ -27,7 +27,7 @@ ARG CRIU_REF=add-aio-and-parallel-memfd
 # criu-image-streamer is the Rust binary that multiplexes CRIU image data
 # through S3 shard pipes; build it alongside CRIU from the upstream repo.
 ARG CIS_REPO=https://github.com/checkpoint-restore/criu-image-streamer.git
-ARG CIS_REF=main
+ARG CIS_REF=master
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
 # For placeholder target only - this default allows agent builds to succeed,
