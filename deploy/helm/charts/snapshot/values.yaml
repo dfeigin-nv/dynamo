@@ -189,6 +189,14 @@ config:
       - "*/.cache/vllm/torch_compile_cache"
       - "*/__pycache__"
       - "*.pyc"
+      # HF Hub `snapshot_download` lands here whenever the loader fetches
+      # the repo (runai-model-streamer pre-fetches safetensors before
+      # streaming to GPU; see TODO investigation). Without this the model
+      # weights leak into rootfs-diff (verified 16 GB on Qwen3-8B, 1.4 GB
+      # on Qwen3-0.6B). Pattern is HF-Hub canonical so it matches both
+      # /workspace/models--<org>--<model>/ and /root/.cache/huggingface/hub/models--*/.
+      - "*/models--*"
+      - "*/.locks"
 
   restore:
     # Path to the nsrestore binary in the placeholder image
