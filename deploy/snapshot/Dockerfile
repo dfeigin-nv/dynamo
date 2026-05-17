@@ -112,7 +112,7 @@ ARG CRIU_REF
 # Pass --build-arg CRIU_CACHE_BUST=$(date +%s) to force a fresh git fetch
 # when the upstream branch has new commits but ${CRIU_REF} string is
 # unchanged.
-ARG CRIU_CACHE_BUST=5
+ARG CRIU_CACHE_BUST=6
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
