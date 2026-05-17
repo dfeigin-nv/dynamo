@@ -1,6 +1,7 @@
 package criu
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,38 +19,81 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
 )
 
-// writePipelineCManifest walks checkpointPath for pages-*.img files and
-// emits a streamer-compatible JSON manifest at <workDir>/pipeline-c-
-// manifest.json. Each entry is one pages_img_id with the on-disk path
-// as source. Returns the manifest path.
+// pagesS3IndexEntry mirrors the schema produced by streams3.writePagesS3Index.
+type pagesS3IndexEntry struct {
+	ID   uint32 `json:"id"`
+	Size uint64 `json:"size"`
+	Key  string `json:"key"`
+}
+
+type pagesS3Index struct {
+	Bucket string              `json:"bucket"`
+	Prefix string              `json:"prefix"`
+	Pages  []pagesS3IndexEntry `json:"pages"`
+}
+
+// PagesS3IndexFilename is the sidecar written by streams3.writePagesS3Index
+// when STREAM_MODE=c skips pages-*.img from the s5cmd download. Read by
+// writePipelineCManifest to emit s3:// sources instead of on-disk paths.
+const PagesS3IndexFilename = "pages-s3-index.json"
+
+// writePipelineCManifest emits a streamer-compatible JSON manifest at
+// <workDir>/pipeline-c-manifest.json. When <checkpointPath>/pages-s3-
+// index.json exists the private_ranges sources are s3:// URIs (Stage 1
+// of streaming-c-mvp: streamer fetches pages directly from S3). Otherwise
+// it walks checkpointPath for pages-*.img and emits on-disk paths.
 func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
-	entries, err := os.ReadDir(checkpointPath)
-	if err != nil {
-		return "", fmt.Errorf("readdir %s: %w", checkpointPath, err)
-	}
 	type rangeEntry struct {
 		ID     uint32 `json:"id"`
 		Size   uint64 `json:"size"`
 		Source string `json:"source"`
+		Bucket string `json:"bucket,omitempty"`
+		Key    string `json:"key,omitempty"`
 	}
 	var priv []rangeEntry
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "pages-") || !strings.HasSuffix(name, ".img") {
-			continue
+
+	idxPath := filepath.Join(checkpointPath, PagesS3IndexFilename)
+	if idxBytes, err := os.ReadFile(idxPath); err == nil {
+		var idx pagesS3Index
+		if err := json.Unmarshal(idxBytes, &idx); err != nil {
+			return "", fmt.Errorf("parse %s: %w", idxPath, err)
 		}
-		idStr := strings.TrimSuffix(strings.TrimPrefix(name, "pages-"), ".img")
-		var id uint32
-		if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-			continue
+		for _, p := range idx.Pages {
+			src := fmt.Sprintf("s3://%s/%s", idx.Bucket, p.Key)
+			priv = append(priv, rangeEntry{
+				ID:     p.ID,
+				Size:   p.Size,
+				Source: src,
+				Bucket: idx.Bucket,
+				Key:    p.Key,
+			})
 		}
-		src := filepath.Join(checkpointPath, name)
-		info, err := os.Stat(src)
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("read %s: %w", idxPath, err)
+	} else {
+		entries, err := os.ReadDir(checkpointPath)
 		if err != nil {
-			return "", fmt.Errorf("stat %s: %w", src, err)
+			return "", fmt.Errorf("readdir %s: %w", checkpointPath, err)
 		}
-		priv = append(priv, rangeEntry{ID: id, Size: uint64(info.Size()), Source: src})
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasPrefix(name, "pages-") || !strings.HasSuffix(name, ".img") {
+				continue
+			}
+			idStr := strings.TrimSuffix(strings.TrimPrefix(name, "pages-"), ".img")
+			var id uint32
+			if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+				continue
+			}
+			src := filepath.Join(checkpointPath, name)
+			info, err := os.Stat(src)
+			if err != nil {
+				return "", fmt.Errorf("stat %s: %w", src, err)
+			}
+			priv = append(priv, rangeEntry{ID: id, Size: uint64(info.Size()), Source: src})
+		}
 	}
+
 	if workDir == "" {
 		workDir = checkpointPath
 	}
@@ -64,8 +108,14 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 			body = append(body, ',')
 		}
 		first = false
-		body = append(body, []byte(fmt.Sprintf(
-			`{"id":%d,"size":%d,"source":%q}`, r.ID, r.Size, r.Source))...)
+		if r.Bucket != "" {
+			body = append(body, []byte(fmt.Sprintf(
+				`{"id":%d,"size":%d,"source":%q,"bucket":%q,"key":%q}`,
+				r.ID, r.Size, r.Source, r.Bucket, r.Key))...)
+		} else {
+			body = append(body, []byte(fmt.Sprintf(
+				`{"id":%d,"size":%d,"source":%q}`, r.ID, r.Size, r.Source))...)
+		}
 	}
 	body = append(body, []byte("]}")...)
 	if err := os.WriteFile(out, body, 0o644); err != nil {
