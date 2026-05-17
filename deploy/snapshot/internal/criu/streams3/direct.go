@@ -129,18 +129,36 @@ func ExecuteRestoreS3Direct(
 		return nil, 0, fmt.Errorf("failed to create restore dir: %w", err)
 	}
 
-	// Download all checkpoint files from S3
+	// Pipeline C (Stage 1): when STREAM_MODE=c the streamer fetches
+	// pages-*.img directly from S3 into memfds, so the agent only
+	// needs the metadata (mm-*.img, pagemap-*.img, files.img, core-*.img,
+	// etc.) on the local tmpfs. Pages stay in S3; a sidecar index lets
+	// writePipelineCManifest emit s3:// sources for each pages_img_id.
+	streamModeC := os.Getenv("STREAM_MODE") == "c"
+
 	s3Src := fmt.Sprintf("%s/%s/*", s3URI, hash)
 	log.Info("Downloading checkpoint from S3", "src", s3Src, "dest", tmpDir,
+		"stream_mode_c", streamModeC,
 		"cmd", "s5cmd --numworkers 256 cp -c 32")
 	downloadStart := time.Now()
-	cmd := exec.Command("s5cmd", "--numworkers", "256", "cp", "-c", "32", s3Src, tmpDir+"/")
+	cpArgs := []string{"--numworkers", "256", "cp", "-c", "32"}
+	if streamModeC {
+		cpArgs = append(cpArgs, "--exclude", "pages-*.img")
+	}
+	cpArgs = append(cpArgs, s3Src, tmpDir+"/")
+	cmd := exec.Command("s5cmd", cpArgs...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return nil, 0, fmt.Errorf("s5cmd download failed: %w", err)
 	}
 	downloadDuration := time.Since(downloadStart)
+
+	if streamModeC {
+		if err := writePagesS3Index(s3URI, hash, tmpDir, log); err != nil {
+			return nil, 0, fmt.Errorf("pages S3 index: %w", err)
+		}
+	}
 
 	// Measure downloaded size for throughput logging
 	var totalBytes int64

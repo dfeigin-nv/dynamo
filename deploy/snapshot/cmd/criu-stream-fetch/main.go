@@ -31,7 +31,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,6 +43,8 @@ type rangeEntry struct {
 	ID     uint32 `json:"id"`
 	Size   uint64 `json:"size"`
 	Source string `json:"source"`
+	Bucket string `json:"bucket,omitempty"`
+	Key    string `json:"key,omitempty"`
 }
 
 type manifest struct {
@@ -156,7 +161,13 @@ func copyFileToFdAt(memfd int, off int64, source string) error {
 		return err
 	}
 	defer src.Close()
-	buf := make([]byte, 64*1024)
+	return copyReaderToFdAt(memfd, off, src)
+}
+
+// copyReaderToFdAt is the source-agnostic pwrite loop shared by file
+// and S3-stdout fillers.
+func copyReaderToFdAt(memfd int, off int64, src io.Reader) error {
+	buf := make([]byte, 1<<20)
 	cur := off
 	for {
 		n, rerr := src.Read(buf)
@@ -177,6 +188,40 @@ func copyFileToFdAt(memfd int, off int64, source string) error {
 			return rerr
 		}
 	}
+}
+
+// fillMemfdFromS3 streams s5cmd cat <s3uri> stdout into memfd via pwrite.
+// Stage 1 fallback: sequential single-stream cat. Stage 2 replaces this
+// with NIXL OBJ postXfer (PreallocatedStreamBuf into the same memfd).
+func fillMemfdFromS3(memfd int, s3uri string) error {
+	cmd := exec.Command("s5cmd", "cat", s3uri)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("s5cmd cat stdout pipe: %w", err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("s5cmd cat start: %w", err)
+	}
+	if err := copyReaderToFdAt(memfd, 0, stdout); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("s5cmd cat copy: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("s5cmd cat wait: %w", err)
+	}
+	return nil
+}
+
+// fillFromSource dispatches based on the manifest range's source URI scheme.
+// s3:// sources go through fillMemfdFromS3 (Stage 1 sequential s5cmd cat),
+// local paths use the existing copyFileToFdAt loop.
+func fillFromSource(memfd int, r *rangeEntry) error {
+	if strings.HasPrefix(r.Source, "s3://") {
+		return fillMemfdFromS3(memfd, r.Source)
+	}
+	return copyFileToFdAt(memfd, 0, r.Source)
 }
 
 
@@ -281,11 +326,39 @@ func main() {
 	// CRIU writes a 4-byte uint32 pages_img_id; streamer replies with
 	// SCM_RIGHTS(memfd) for that id plus a 1-byte 'A' ack after the
 	// memfd has been fully filled. Loop until CRIU closes the socket.
+	//
+	// Stage 1 overlap: pre-create one memfd per private range and
+	// launch a fill goroutine immediately so the bytes-mover runs in
+	// parallel with CRIU's non-PIE setup phase. CRIU's per-task request
+	// then sends the already-prepped memfd and waits only on the
+	// goroutine's done channel before acking.
+	type privateState struct {
+		memfd int
+		done  chan error
+	}
+	states := make(map[uint32]*privateState, len(m.PrivateRanges))
 	if len(m.PrivateRanges) > 0 {
-		// Index manifest entries by id for O(1) lookup.
-		byID := make(map[uint32]*rangeEntry, len(m.PrivateRanges))
 		for i := range m.PrivateRanges {
-			byID[m.PrivateRanges[i].ID] = &m.PrivateRanges[i]
+			r := &m.PrivateRanges[i]
+			pfd, err := memfdCreate(fmt.Sprintf("criu-private-%d", r.ID), r.Size)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+				poisonAbort(abortFd)
+				os.Exit(1)
+			}
+			st := &privateState{memfd: pfd, done: make(chan error, 1)}
+			states[r.ID] = st
+			fmt.Fprintf(os.Stderr, "[stream] prefetch start id=%d size=%d src=%s ts=%s\n",
+				r.ID, r.Size, r.Source, time.Now().UTC().Format(time.RFC3339Nano))
+			go func(r *rangeEntry, st *privateState) {
+				t0 := time.Now()
+				err := fillFromSource(st.memfd, r)
+				elapsed := time.Since(t0)
+				st.done <- err
+				fmt.Fprintf(os.Stderr, "[stream] prefetch done id=%d elapsed_ms=%d err=%v ts=%s\n",
+					r.ID, elapsed.Milliseconds(), err,
+					time.Now().UTC().Format(time.RFC3339Nano))
+			}(r, st)
 		}
 
 		for {
@@ -305,28 +378,19 @@ func main() {
 				os.Exit(1)
 			}
 			id := binary.NativeEndian.Uint32(hdr[:])
-			r := byID[id]
-			if r == nil {
-				fmt.Fprintf(os.Stderr, "criu-stream-fetch: manifest missing pages_img_id=%u\n", id)
+			st := states[id]
+			if st == nil {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: manifest missing pages_img_id=%d\n", id)
 				poisonAbort(abortFd)
 				os.Exit(1)
 			}
 
-			pfd, err := memfdCreate(fmt.Sprintf("criu-private-%d", id), r.Size)
-			if err != nil {
+			if err := sendPrivateFd(privateSock, st.memfd); err != nil {
 				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
 				poisonAbort(abortFd)
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "[stream] id=%d size=%d src=%s\n",
-				id, r.Size, r.Source)
-
-			if err := sendPrivateFd(privateSock, pfd); err != nil {
-				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-				poisonAbort(abortFd)
-				os.Exit(1)
-			}
-			if err := copyFileToFdAt(pfd, 0, r.Source); err != nil {
+			if err := <-st.done; err != nil {
 				fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill id=%d: %v\n", id, err)
 				poisonAbort(abortFd)
 				os.Exit(1)
@@ -336,7 +400,15 @@ func main() {
 				poisonAbort(abortFd)
 				os.Exit(1)
 			}
-			unix.Close(pfd)
+			unix.Close(st.memfd)
+			delete(states, id)
+		}
+		// Drain any prefetch goroutines CRIU never claimed (e.g. the
+		// task exited early). Best-effort: close memfds to release tmpfs.
+		for id, st := range states {
+			<-st.done
+			unix.Close(st.memfd)
+			delete(states, id)
 		}
 		fmt.Fprintf(os.Stderr, "[stream] private loop done\n")
 	}
