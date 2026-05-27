@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -112,68 +113,82 @@ func ExecuteRestoreS3Direct(
 	cgroupRoot string,
 	log logr.Logger,
 ) (*types.CheckpointManifest, int32, error) {
-	// Mount dedicated tmpfs (must survive the /dev/shm unmount before CRIU restore)
-	if err := os.MkdirAll(directS3TmpfsMount, 0755); err != nil {
-		return nil, 0, fmt.Errorf("failed to create tmpfs mount point: %w", err)
-	}
-	if err := syscall.Mount("tmpfs", directS3TmpfsMount, "tmpfs", 0, "size=90%"); err != nil {
-		return nil, 0, fmt.Errorf("failed to mount tmpfs at %s: %w", directS3TmpfsMount, err)
-	}
-	defer func() {
-		_ = syscall.Unmount(directS3TmpfsMount, 0)
-		_ = os.RemoveAll(directS3TmpfsMount)
-	}()
+	var tmpDir string
 
-	tmpDir := filepath.Join(directS3TmpfsMount, hash)
-	if err := os.MkdirAll(tmpDir, 0755); err != nil {
-		return nil, 0, fmt.Errorf("failed to create restore dir: %w", err)
-	}
-
-	// Pipeline C (Stage 1): when STREAM_MODE=c the streamer fetches
-	// pages-*.img directly from S3 into memfds, so the agent only
-	// needs the metadata (mm-*.img, pagemap-*.img, files.img, core-*.img,
-	// etc.) on the local tmpfs. Pages stay in S3; a sidecar index lets
-	// writePipelineCManifest emit s3:// sources for each pages_img_id.
-	streamModeC := os.Getenv("STREAM_MODE") == "c"
-
-	s3Src := fmt.Sprintf("%s/%s/*", s3URI, hash)
-	log.Info("Downloading checkpoint from S3", "src", s3Src, "dest", tmpDir,
-		"stream_mode_c", streamModeC,
-		"cmd", "s5cmd --numworkers 256 cp -c 32")
-	downloadStart := time.Now()
-	cpArgs := []string{"--numworkers", "256", "cp", "-c", "32"}
-	if streamModeC {
-		cpArgs = append(cpArgs, "--exclude", "pages-*.img")
-	}
-	cpArgs = append(cpArgs, s3Src, tmpDir+"/")
-	cmd := exec.Command("s5cmd", cpArgs...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return nil, 0, fmt.Errorf("s5cmd download failed: %w", err)
-	}
-	downloadDuration := time.Since(downloadStart)
-
-	if streamModeC {
-		if err := writePagesS3Index(s3URI, hash, tmpDir, log); err != nil {
-			return nil, 0, fmt.Errorf("pages S3 index: %w", err)
+	// RESTORE_SOURCE=juicefs:<path> skips the tmpfs+s5cmd materialization and
+	// points CRIU at a pre-mounted FUSE checkpoint directory (JuiceFS, S3FS,
+	// etc.). When set, the env value is the full per-checkpoint directory
+	// (e.g. juicefs:/mnt/jfs/checkpoints/ckpt-qwen3-14b) so the agent does
+	// not need to construct paths from hash. Used by the JuiceFS-vs-s5cmd
+	// restore benchmark.
+	if src := os.Getenv("RESTORE_SOURCE"); strings.HasPrefix(src, "juicefs:") {
+		tmpDir = strings.TrimPrefix(src, "juicefs:")
+		log.Info("Restoring from FUSE-mounted checkpoint, skipping tmpfs+s5cmd",
+			"dir", tmpDir, "source", src)
+	} else {
+		// Mount dedicated tmpfs (must survive the /dev/shm unmount before CRIU restore)
+		if err := os.MkdirAll(directS3TmpfsMount, 0755); err != nil {
+			return nil, 0, fmt.Errorf("failed to create tmpfs mount point: %w", err)
 		}
-	}
-
-	// Measure downloaded size for throughput logging
-	var totalBytes int64
-	_ = filepath.Walk(tmpDir, func(_ string, info os.FileInfo, _ error) error {
-		if info != nil && !info.IsDir() {
-			totalBytes += info.Size()
+		if err := syscall.Mount("tmpfs", directS3TmpfsMount, "tmpfs", 0, "size=90%"); err != nil {
+			return nil, 0, fmt.Errorf("failed to mount tmpfs at %s: %w", directS3TmpfsMount, err)
 		}
-		return nil
-	})
-	throughputMBps := float64(totalBytes) / downloadDuration.Seconds() / 1024 / 1024
-	log.Info("S3 download complete",
-		"duration", downloadDuration,
-		"total_mb", totalBytes/1024/1024,
-		"throughput_mbps", fmt.Sprintf("%.0f", throughputMBps),
-	)
+		defer func() {
+			_ = syscall.Unmount(directS3TmpfsMount, 0)
+			_ = os.RemoveAll(directS3TmpfsMount)
+		}()
+
+		tmpDir = filepath.Join(directS3TmpfsMount, hash)
+		if err := os.MkdirAll(tmpDir, 0755); err != nil {
+			return nil, 0, fmt.Errorf("failed to create restore dir: %w", err)
+		}
+
+		// Pipeline C (Stage 1): when STREAM_MODE=c the streamer fetches
+		// pages-*.img directly from S3 into memfds, so the agent only
+		// needs the metadata (mm-*.img, pagemap-*.img, files.img, core-*.img,
+		// etc.) on the local tmpfs. Pages stay in S3; a sidecar index lets
+		// writePipelineCManifest emit s3:// sources for each pages_img_id.
+		streamModeC := os.Getenv("STREAM_MODE") == "c"
+
+		s3Src := fmt.Sprintf("%s/%s/*", s3URI, hash)
+		log.Info("Downloading checkpoint from S3", "src", s3Src, "dest", tmpDir,
+			"stream_mode_c", streamModeC,
+			"cmd", "s5cmd --numworkers 256 cp -c 32")
+		downloadStart := time.Now()
+		cpArgs := []string{"--numworkers", "256", "cp", "-c", "32"}
+		if streamModeC {
+			cpArgs = append(cpArgs, "--exclude", "pages-*.img")
+		}
+		cpArgs = append(cpArgs, s3Src, tmpDir+"/")
+		cmd := exec.Command("s5cmd", cpArgs...)
+		cmd.Stdout = os.Stderr
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return nil, 0, fmt.Errorf("s5cmd download failed: %w", err)
+		}
+		downloadDuration := time.Since(downloadStart)
+
+		if streamModeC {
+			if err := writePagesS3Index(s3URI, hash, tmpDir, log); err != nil {
+				return nil, 0, fmt.Errorf("pages S3 index: %w", err)
+			}
+		}
+
+		// Measure downloaded size for throughput logging
+		var totalBytes int64
+		_ = filepath.Walk(tmpDir, func(_ string, info os.FileInfo, _ error) error {
+			if info != nil && !info.IsDir() {
+				totalBytes += info.Size()
+			}
+			return nil
+		})
+		throughputMBps := float64(totalBytes) / downloadDuration.Seconds() / 1024 / 1024
+		log.Info("S3 download complete",
+			"duration", downloadDuration,
+			"total_mb", totalBytes/1024/1024,
+			"throughput_mbps", fmt.Sprintf("%.0f", throughputMBps),
+		)
+	}
 
 	// Read manifest
 	m, err := types.ReadManifest(tmpDir)
