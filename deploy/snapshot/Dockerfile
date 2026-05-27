@@ -202,6 +202,17 @@ RUN curl -fsSL -o /tmp/s5cmd.tar.gz \
     && rm -f /tmp/s5cmd.tar.gz \
     && s5cmd version
 
+# JuiceFS CE CLI: used by ExecuteRestoreS3Direct when RESTORE_SOURCE=juicefs:...
+# to run `juicefs warmup` against the FUSE-mounted checkpoint dir before
+# CRIU restore. Pre-populates the JFS local cache with parallel S3 GETs so
+# CRIU's serial mmap reads hit cache instead of going through FUSE per-page.
+ARG JUICEFS_VERSION=1.3.1
+RUN curl -fsSL -o /tmp/juicefs.tar.gz \
+      "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-amd64.tar.gz" \
+    && tar -xzf /tmp/juicefs.tar.gz -C /usr/local/bin juicefs \
+    && rm -f /tmp/juicefs.tar.gz \
+    && juicefs version
+
 # Install AWS CLI v2 from the official bundled installer, with GPG signature
 # verification against the AWS CLI Team public key (key ID A6310ACC4672475C,
 # fingerprint FB5DB77FD5C118B80511ADA8A6310ACC4672475C, valid through 2026-07).
@@ -327,6 +338,17 @@ RUN curl -fsSL -o /tmp/s5cmd.tar.gz \
     && tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd \
     && rm -f /tmp/s5cmd.tar.gz \
     && s5cmd version
+
+# JuiceFS CE CLI: used by ExecuteRestoreS3Direct when RESTORE_SOURCE=juicefs:...
+# to run `juicefs warmup` against the FUSE-mounted checkpoint dir before
+# CRIU restore. Pre-populates the JFS local cache with parallel S3 GETs so
+# CRIU's serial mmap reads hit cache instead of going through FUSE per-page.
+ARG JUICEFS_VERSION=1.3.1
+RUN curl -fsSL -o /tmp/juicefs.tar.gz \
+      "https://github.com/juicedata/juicefs/releases/download/v${JUICEFS_VERSION}/juicefs-${JUICEFS_VERSION}-linux-amd64.tar.gz" \
+    && tar -xzf /tmp/juicefs.tar.gz -C /usr/local/bin juicefs \
+    && rm -f /tmp/juicefs.tar.gz \
+    && juicefs version
 
 # Install AWS CLI v2 from the official bundled installer with GPG sig verify
 # (same approach + key block as the agent stage above).

@@ -125,6 +125,26 @@ func ExecuteRestoreS3Direct(
 		tmpDir = strings.TrimPrefix(src, "juicefs:")
 		log.Info("Restoring from FUSE-mounted checkpoint, skipping tmpfs+s5cmd",
 			"dir", tmpDir, "source", src)
+
+		// Pre-stage via `juicefs warmup` so CRIU's serial mmap-driven reads
+		// hit the JuiceFS local cache instead of going through FUSE+S3
+		// per-page. Warmup itself uses internal parallelism (default 50
+		// workers) and saturates the S3 connection comparably to s5cmd.
+		// Disabled by setting RESTORE_NO_WARMUP=1 (for measuring pure cold
+		// JFS-FUSE throughput).
+		if os.Getenv("RESTORE_NO_WARMUP") != "1" {
+			warmupStart := time.Now()
+			log.Info("juicefs warmup: pre-staging checkpoint into local cache", "dir", tmpDir)
+			warmupCmd := exec.Command("juicefs", "warmup", tmpDir)
+			warmupCmd.Stdout = os.Stderr
+			warmupCmd.Stderr = os.Stderr
+			if err := warmupCmd.Run(); err != nil {
+				log.Error(err, "juicefs warmup failed (best-effort, continuing)", "dir", tmpDir)
+			} else {
+				log.Info("juicefs warmup complete", "dir", tmpDir,
+					"duration", time.Since(warmupStart))
+			}
+		}
 	} else {
 		// Mount dedicated tmpfs (must survive the /dev/shm unmount before CRIU restore)
 		if err := os.MkdirAll(directS3TmpfsMount, 0755); err != nil {
