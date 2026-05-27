@@ -95,6 +95,13 @@ storage:
     credentialsSecretRef: ""
     shardLZ4: false
     directMode: true
+    # restoreSource: when set, the agent restores from a pre-mounted FUSE
+    # checkpoint directory instead of materializing the checkpoint into a
+    # tmpfs via s5cmd. The value must include a scheme prefix and the full
+    # per-checkpoint path, e.g. "juicefs:/mnt/jfs/checkpoints/ckpt-qwen3-14b".
+    # Only consumed by ExecuteRestoreS3Direct when directMode=true.
+    # Leave empty to use the standard tmpfs+s5cmd path.
+    restoreSource: ""
 
   # Reserved for future snapshot-owned backends. Unsupported today.
   oci:

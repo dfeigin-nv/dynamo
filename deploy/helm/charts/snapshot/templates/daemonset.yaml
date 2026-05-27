@@ -127,6 +127,18 @@ spec:
             # Only consulted on the streaming path (S3_DIRECT=0).
             - name: S3_SHARD_LZ4
               value: {{ ternary "1" "0" .Values.storage.s3.shardLZ4 | quote }}
+            # STREAM_MODE explicitly cleared. Pipeline C (STREAM_MODE=c) is
+            # opt-in only; this defense-in-depth assignment prevents stale
+            # cluster-config or prior `kubectl set env` from accidentally
+            # engaging Pipeline C on the direct path.
+            - name: STREAM_MODE
+              value: ""
+            # RESTORE_SOURCE: optional FUSE-mounted checkpoint directory
+            # (juicefs:/mnt/jfs/...). When set, ExecuteRestoreS3Direct skips
+            # the tmpfs+s5cmd materialization and reads directly from the
+            # mount. See storage.s3.restoreSource in values.yaml.
+            - name: RESTORE_SOURCE
+              value: {{ .Values.storage.s3.restoreSource | default "" | quote }}
             {{- end }}
             {{- if .Values.rbac.namespaceRestricted }}
             # Restrict pod watching to this namespace (namespace-scoped RBAC)
