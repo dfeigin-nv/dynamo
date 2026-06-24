@@ -19,6 +19,7 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/criu/streams3"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/cuda"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/logging"
+	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/memfdcache"
 	snapshotruntime "github.com/ai-dynamo/dynamo/deploy/snapshot/internal/runtime"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
 	snapshotprotocol "github.com/ai-dynamo/dynamo/deploy/snapshot/protocol"
@@ -38,6 +39,10 @@ type RestoreRequest struct {
 	TargetPodIP                 string
 	ContainerName               string
 	Clientset                   kubernetes.Interface
+	// MemfdCache is the node-local memfd content cache server, or nil when
+	// disabled. When set, execNSRestore opens a per-restore session and passes
+	// its criu-side socket fd down to CRIU.
+	MemfdCache *memfdcache.Server
 }
 
 // Restore performs external restore for the given request.
@@ -151,16 +156,16 @@ func inspectRestore(ctx context.Context, rt snapshotruntime.Runtime, log logr.Lo
 		containerName = "main"
 	}
 
-	var placeholderPID int
-	if req.ContainerID != "" {
-		placeholderPID, _, err = rt.ResolveContainer(ctx, req.ContainerID)
-	} else {
-		placeholderPID, _, err = rt.ResolveContainerByPod(ctx, req.PodName, req.PodNamespace, containerName)
-	}
+	// Resolve the EXACT live container by ID (from the current pod's status),
+	// not by pod-name label. A deleted+recreated placeholder under the same name
+	// leaves a stale containerd container with the same labels whose recorded
+	// task PID points at a now-orphaned process; ResolveContainerByPod can return
+	// that dead PID and nsenter then fails with "cannot open /proc/<pid>/ns/ipc".
+	placeholderPID, _, err := rt.ResolveContainer(ctx, req.ContainerID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve placeholder container: %w", err)
+		return nil, fmt.Errorf("failed to resolve placeholder container %s: %w", req.ContainerID, err)
 	}
-	log.V(1).Info("Resolved placeholder container", "pid", placeholderPID)
+	log.V(1).Info("Resolved placeholder container", "pid", placeholderPID, "container_id", req.ContainerID)
 
 	cgroupRoot, err := snapshotruntime.ResolveCgroupRootFromHostPID(placeholderPID)
 	if err != nil {
@@ -250,9 +255,32 @@ func execNSRestore(ctx context.Context, log logr.Logger, req RestoreRequest, sna
 		args = append(args, "--target-pod-ip", req.TargetPodIP)
 	}
 
+	// Node-local memfd cache: open a per-restore session in the agent (host ns)
+	// and pass its criu-side socket to nsrestore as ExtraFiles[0] (fd 3 in the
+	// child). nsenter execs nsrestore with the fd preserved; nsrestore hands it
+	// to go-criu, which passes it to criu swrk. SCM_RIGHTS over this inherited
+	// socketpair crosses the placeholder namespaces, so no bind-mount is needed.
+	// Closing the criu end after the run releases every borrow taken on it.
+	var extraFiles []*os.File
+	if req.MemfdCache != nil && req.CheckpointID != "" {
+		session, sErr := req.MemfdCache.NewSession()
+		if sErr != nil {
+			log.Error(sErr, "memfd cache: failed to open session; restoring without cache")
+		} else {
+			defer session.Close()
+			cacheFD := 3 + len(extraFiles)
+			extraFiles = append(extraFiles, session)
+			args = append(args,
+				"--memfd-cache-fd", strconv.Itoa(cacheFD),
+				"--memfd-cache-id", req.CheckpointID,
+			)
+		}
+	}
+
 	cmd := exec.CommandContext(ctx, "nsenter", args...)
 	// Inherit the agent environment so nsrestore uses the same logger settings.
 	cmd.Env = os.Environ()
+	cmd.ExtraFiles = extraFiles
 	log.V(1).Info("Executing nsenter + nsrestore", "cmd", cmd.String())
 
 	var stdout bytes.Buffer

@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/util/retry"
 
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/executor"
+	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/memfdcache"
 	snapshotruntime "github.com/ai-dynamo/dynamo/deploy/snapshot/internal/runtime"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
 	snapshotprotocol "github.com/ai-dynamo/dynamo/deploy/snapshot/protocol"
@@ -41,6 +42,11 @@ type NodeController struct {
 	runtime   snapshotruntime.Runtime
 	log       logr.Logger
 	holderID  string
+
+	// memfdCache is the node-local memfd content cache server, or nil when
+	// disabled. Threaded into each RestoreRequest so the executor can open a
+	// per-restore session over which CRIU borrows/donates sealed memfds.
+	memfdCache *memfdcache.Server
 
 	inFlight   map[string]struct{}
 	inFlightMu sync.Mutex
@@ -67,6 +73,7 @@ const (
 func NewNodeController(
 	cfg *types.AgentConfig,
 	rt snapshotruntime.Runtime,
+	memfdCache *memfdcache.Server,
 	log logr.Logger,
 ) (*NodeController, error) {
 	restConfig, err := rest.InClusterConfig()
@@ -80,13 +87,14 @@ func NewNodeController(
 	}
 
 	return &NodeController{
-		config:    cfg,
-		clientset: clientset,
-		runtime:   rt,
-		log:       log,
-		holderID:  "snapshot-agent/" + uuid.NewString(),
-		inFlight:  make(map[string]struct{}),
-		stopCh:    make(chan struct{}),
+		config:     cfg,
+		clientset:  clientset,
+		runtime:    rt,
+		log:        log,
+		holderID:   "snapshot-agent/" + uuid.NewString(),
+		memfdCache: memfdCache,
+		inFlight:   make(map[string]struct{}),
+		stopCh:     make(chan struct{}),
 	}, nil
 }
 
@@ -812,6 +820,7 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 		TargetPodIP:                 pod.Status.PodIP,
 		ContainerName:               containerName,
 		Clientset:                   w.clientset,
+		MemfdCache:                  w.memfdCache,
 	}
 	placeholderHostPID, err := executor.Restore(restoreCtx, w.runtime, log, req)
 	if err != nil {

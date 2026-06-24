@@ -111,6 +111,8 @@ func ExecuteDumpS3Direct(
 func ExecuteRestoreS3Direct(
 	s3URI, hash string,
 	cgroupRoot string,
+	memfdCacheFD int,
+	memfdCacheID string,
 	log logr.Logger,
 ) (*types.CheckpointManifest, int32, error) {
 	var tmpDir string
@@ -242,7 +244,7 @@ func ExecuteRestoreS3Direct(
 
 	// CRIU restore from tmpfs directory (same as PVC path)
 	log.Info("Executing CRIU restore from tmpfs", "dir", tmpDir)
-	restoredPID, err := criu.ExecuteRestore(criuOpts, m, tmpDir, log)
+	restoredPID, err := criu.ExecuteRestore(criuOpts, m, tmpDir, memfdCacheFD, memfdCacheID, log)
 	if err != nil {
 		return nil, 0, err
 	}

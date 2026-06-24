@@ -318,6 +318,8 @@ func ExecuteRestoreS3(
 	s3URI, hash string,
 	numShards int,
 	cgroupRoot string,
+	memfdCacheFD int,
+	memfdCacheID string,
 	log logr.Logger,
 ) (*types.CheckpointManifest, int32, error) {
 	if numShards <= 0 {
@@ -561,8 +563,11 @@ func ExecuteRestoreS3(
 	criuOpts.ImagesDir = proto.String(socketDir)
 	criuOpts.ImagesDirFd = proto.Int32(-1) // required field; -1 = use ImagesDir string
 
+	cleanupCache := criu.ApplyMemfdCache(criuClient, criuOpts, memfdCacheFD, memfdCacheID, log)
+	defer cleanupCache()
+
 	notify := criu.NewRestoreNotify(log)
-	log.Info("Executing go-criu Restore call")
+	log.Info("Executing go-criu Restore call", "memfd_cache", criuOpts.GetMemfdCache())
 	restoreStart := time.Now()
 	if err := criuClient.Restore(criuOpts, notify); err != nil {
 		// WorkDirFd points to criuWorkDir; fall back to socketDir if that failed.

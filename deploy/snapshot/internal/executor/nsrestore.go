@@ -28,6 +28,11 @@ type RestoreOptions struct {
 	CUDADeviceMap         string
 	CgroupRoot            string
 	TargetPodIP           string
+	// MemfdCacheFD is the inherited criu-side memfd cache socket fd, or -1 when
+	// the cache is disabled. MemfdCacheID scopes the cache to one checkpoint
+	// image. Both are passed through to the CRIU restore (PVC and S3 paths).
+	MemfdCacheFD int
+	MemfdCacheID string
 }
 
 type RestoreInNamespaceResult struct {
@@ -137,7 +142,7 @@ func executeRestore(ctx context.Context, criuOpts *criurpc.CriuOpts, m *types.Ch
 
 	// CRIU restore
 	criuRestoreStart := time.Now()
-	restoredPID, err := criu.ExecuteRestore(criuOpts, m, opts.CheckpointPath, log)
+	restoredPID, err := criu.ExecuteRestore(criuOpts, m, opts.CheckpointPath, opts.MemfdCacheFD, opts.MemfdCacheID, log)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -223,11 +228,13 @@ func restoreInNamespaceS3(ctx context.Context, opts RestoreOptions, log logr.Log
 	criuRestoreStart := time.Now()
 	if os.Getenv("S3_DIRECT") == "1" {
 		manifest, restoredPID, err = streams3.ExecuteRestoreS3Direct(
-			opts.CheckpointLocation, opts.CheckpointHash, opts.CgroupRoot, log,
+			opts.CheckpointLocation, opts.CheckpointHash, opts.CgroupRoot,
+			opts.MemfdCacheFD, opts.MemfdCacheID, log,
 		)
 	} else {
 		manifest, restoredPID, err = streams3.ExecuteRestoreS3(
-			opts.CheckpointLocation, opts.CheckpointHash, 0, opts.CgroupRoot, log,
+			opts.CheckpointLocation, opts.CheckpointHash, 0, opts.CgroupRoot,
+			opts.MemfdCacheFD, opts.MemfdCacheID, log,
 		)
 	}
 	if err != nil {

@@ -112,7 +112,7 @@ ARG CRIU_REF
 # Pass --build-arg CRIU_CACHE_BUST=$(date +%s) to force a fresh git fetch
 # when the upstream branch has new commits but ${CRIU_REF} string is
 # unchanged.
-ARG CRIU_CACHE_BUST=6
+ARG CRIU_CACHE_BUST=11
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -257,7 +257,7 @@ RUN set -eu \
     && curl -fsSL -o /tmp/awscliv2.zip.sig "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip.sig" \
     && gpg --verify /tmp/awscliv2.zip.sig /tmp/awscliv2.zip \
     && unzip -q /tmp/awscliv2.zip -d /tmp \
-    && /tmp/aws/install \
+    && { if [ -d /usr/local/aws-cli ]; then /tmp/aws/install --update; else /tmp/aws/install; fi; } \
     && aws --version \
     && rm -rf /tmp/awscliv2.zip /tmp/awscliv2.zip.sig /tmp/aws /tmp/aws-cli.pub /root/.gnupg
 
@@ -391,7 +391,7 @@ RUN set -eu \
     && curl -fsSL -o /tmp/awscliv2.zip.sig "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWSCLI_VERSION}.zip.sig" \
     && gpg --verify /tmp/awscliv2.zip.sig /tmp/awscliv2.zip \
     && unzip -q /tmp/awscliv2.zip -d /tmp \
-    && /tmp/aws/install \
+    && { if [ -d /usr/local/aws-cli ]; then /tmp/aws/install --update; else /tmp/aws/install; fi; } \
     && aws --version \
     && rm -rf /tmp/awscliv2.zip /tmp/awscliv2.zip.sig /tmp/aws /tmp/aws-cli.pub /root/.gnupg
 

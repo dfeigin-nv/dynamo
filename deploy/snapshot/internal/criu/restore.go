@@ -207,6 +207,8 @@ func ExecuteRestore(
 	criuOpts *criurpc.CriuOpts,
 	m *types.CheckpointManifest,
 	checkpointPath string,
+	memfdCacheFD int,
+	memfdCacheID string,
 	log logr.Logger,
 ) (int32, error) {
 	settings := m.CRIUDump.CRIU
@@ -273,8 +275,12 @@ func ExecuteRestore(
 		defer sockSwrk.Close()
 	}
 
+	cleanupCache := ApplyMemfdCache(c, criuOpts, memfdCacheFD, memfdCacheID, log)
+	defer cleanupCache()
+
 	notify := &restoreNotify{log: log}
-	log.V(1).Info("Executing go-criu Restore call", "stream_restore", criuOpts.GetStreamRestore())
+	log.V(1).Info("Executing go-criu Restore call",
+		"stream_restore", criuOpts.GetStreamRestore(), "memfd_cache", criuOpts.GetMemfdCache())
 	if err := c.Restore(criuOpts, notify); err != nil {
 		log.Error(err, "go-criu Restore returned error")
 		logging.LogRestoreErrors(checkpointPath, settings.WorkDir, log)
@@ -282,6 +288,25 @@ func ExecuteRestore(
 	}
 
 	return notify.restoredPID, nil
+}
+
+// ApplyMemfdCache wires the node-local memfd content cache onto a restore. When
+// fd >= 0 and id is non-empty it registers the inherited cache socket with
+// go-criu (passed to criu swrk via CRIU_MEMFD_CACHE_SOCK) and sets the
+// MemfdCache/MemfdCacheId opts that gate the feature on the CRIU side. The
+// returned cleanup closes the *os.File wrapper and must run after the Restore
+// RPC. A no-op (and nil cleanup-safe) when the cache is disabled, so it ships
+// dark. Shared by the PVC and S3 restore paths.
+func ApplyMemfdCache(c *criulib.Criu, criuOpts *criurpc.CriuOpts, fd int, id string, log logr.Logger) func() {
+	if fd < 0 || id == "" {
+		return func() {}
+	}
+	f := os.NewFile(uintptr(fd), "memfd-cache-sock")
+	c.SetMemfdCacheSock(f)
+	criuOpts.MemfdCache = proto.Bool(true)
+	criuOpts.MemfdCacheId = proto.String(id)
+	log.V(1).Info("memfd cache enabled for restore", "cache_fd", fd, "cache_id", id)
+	return func() { _ = f.Close() }
 }
 
 // BuildRestoreOpts assembles CriuOpts for a CRIU restore from the checkpoint manifest.

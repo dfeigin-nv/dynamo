@@ -90,8 +90,13 @@ func (r *ContainerdRuntime) findRunningContainerByPod(ctx context.Context, podNa
 		return nil, fmt.Errorf("no container found for pod %s/%s container %s", podNamespace, podName, containerName)
 	}
 
-	// During container restarts, both the old and new container may be listed;
-	// pick the first with a live task.
+	// During container restarts -- or when a placeholder pod is deleted and
+	// recreated under the same name (the benchmark/restore flow) -- both the old
+	// and new container are listed. A just-deleted container can linger in
+	// containerd with a Task that still loads but whose process is gone; its dead
+	// PID passes Task()/Spec() yet nsenter later fails with
+	// "cannot open /proc/<pid>/ns/ipc". Require the task to be actually RUNNING so
+	// we return the live container, not a stale one.
 	for _, c := range containers {
 		if _, err := c.Task(ctx, nil); err == nil {
 			return c, nil

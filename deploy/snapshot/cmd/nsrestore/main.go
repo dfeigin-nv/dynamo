@@ -23,6 +23,8 @@ func main() {
 	cudaDeviceMap := flag.String("cuda-device-map", "", "CUDA device map for cuda-checkpoint-helper restore")
 	cgroupRoot := flag.String("cgroup-root", "", "CRIU cgroup root remap path")
 	targetPodIP := flag.String("target-pod-ip", "", "Restore pod IP for CRIU TCP socket remapping")
+	memfdCacheFD := flag.Int("memfd-cache-fd", -1, "Inherited node-local memfd cache socket fd (-1 = disabled)")
+	memfdCacheID := flag.String("memfd-cache-id", "", "memfd cache scope id (checkpointID[:version])")
 	flag.Parse()
 
 	if *checkpointStorageType == "s3" {
@@ -46,6 +48,8 @@ func main() {
 		CUDADeviceMap:         *cudaDeviceMap,
 		CgroupRoot:            *cgroupRoot,
 		TargetPodIP:           *targetPodIP,
+		MemfdCacheFD:          *memfdCacheFD,
+		MemfdCacheID:          *memfdCacheID,
 	}
 
 	result, err := executor.RestoreInNamespace(context.Background(), opts, log)

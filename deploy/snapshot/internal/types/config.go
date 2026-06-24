@@ -4,6 +4,7 @@ package types
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +18,26 @@ type AgentConfig struct {
 	Overlay             OverlaySettings `yaml:"overlay"`
 	Restore             RestoreSpec     `yaml:"restore"`
 	CRIU                CRIUSettings    `yaml:"criu"`
+	MemfdCache          MemfdCacheSpec  `yaml:"memfdCache"`
+}
+
+// MemfdCacheSpec configures the node-local memfd content cache. Off by default
+// so it ships dark; enable per-deployment once validated.
+type MemfdCacheSpec struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxBytes caps resident cached memfd bytes on the node (0 = unlimited).
+	// Holding a populated memfd pins RAM, so this is the main operational knob.
+	MaxBytes int64 `yaml:"maxBytes"`
+	// IdleTTLSeconds evicts cold (unborrowed) entries after this long (0 = none).
+	IdleTTLSeconds int `yaml:"idleTTLSeconds"`
+}
+
+// IdleTTL returns the configured idle eviction interval.
+func (m *MemfdCacheSpec) IdleTTL() time.Duration {
+	if m.IdleTTLSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(m.IdleTTLSeconds) * time.Second
 }
 
 const (
@@ -34,6 +55,19 @@ func (c *AgentConfig) LoadEnvOverrides() {
 	}
 	if v := os.Getenv("RESTRICTED_NAMESPACE"); v != "" {
 		c.RestrictedNamespace = v
+	}
+	if v := os.Getenv("MEMFD_CACHE_ENABLED"); v != "" {
+		c.MemfdCache.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("MEMFD_CACHE_MAX_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.MemfdCache.MaxBytes = n
+		}
+	}
+	if v := os.Getenv("MEMFD_CACHE_IDLE_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.MemfdCache.IdleTTLSeconds = n
+		}
 	}
 }
 
