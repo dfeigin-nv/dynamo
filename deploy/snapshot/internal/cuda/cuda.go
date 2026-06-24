@@ -181,43 +181,13 @@ func BuildDeviceMap(sourceUUIDs, targetUUIDs []string, log logr.Logger) (string,
 	if len(sourceUUIDs) == 0 {
 		return "", fmt.Errorf("GPU UUID list is empty")
 	}
-	log.V(1).Info("BuildDeviceMap inputs", "source_uuids", sourceUUIDs, "target_uuids", targetUUIDs)
-
-	targetSet := make(map[string]bool, len(targetUUIDs))
-	for _, t := range targetUUIDs {
-		targetSet[t] = true
-	}
-
-	// First pass: identity-map any source UUID that exists in the target set
-	mapping := make(map[string]string, len(sourceUUIDs))
-	usedTargets := make(map[string]bool, len(targetUUIDs))
-	for _, src := range sourceUUIDs {
-		if targetSet[src] {
-			mapping[src] = src
-			usedTargets[src] = true
-		}
-	}
-
-	// Second pass: pair remaining source UUIDs with remaining target UUIDs positionally
-	var remainingTargets []string
-	for _, t := range targetUUIDs {
-		if !usedTargets[t] {
-			remainingTargets = append(remainingTargets, t)
-		}
-	}
-	idx := 0
-	for _, src := range sourceUUIDs {
-		if _, ok := mapping[src]; !ok {
-			mapping[src] = remainingTargets[idx]
-			idx++
-		}
-	}
-
-	pairs := make([]string, len(sourceUUIDs))
-	for i, src := range sourceUUIDs {
-		pairs[i] = src + "=" + mapping[src]
-	}
-	return strings.Join(pairs, ","), nil
+	// cuda-checkpoint 595.45.04 rejects --action restore --device-map with
+	// CUDA_ERROR_INVALID_VALUE -- even for an all-identity map -- and restores
+	// correctly onto the visible GPU(s) without one. The prior (working) agent
+	// passed no device-map at all, including cross-GPU restores. Omit it.
+	log.V(1).Info("omitting --device-map; cuda-checkpoint restores onto the visible GPU",
+		"source_uuids", sourceUUIDs, "target_uuids", targetUUIDs)
+	return "", nil
 }
 
 // LockAndCheckpointProcessTree locks and checkpoints CUDA state for all given PIDs.
