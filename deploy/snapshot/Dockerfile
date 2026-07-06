@@ -286,26 +286,56 @@ USER root
 ENTRYPOINT ["/usr/local/bin/snapshot-agent"]
 
 # =============================================================================
-# Stage: CPP streamer builder - Pipeline C NIXL OBJ streamer
-# Built against the NIXL runtime bundled in the vLLM base image
-# (/opt/nvidia/nvda_nixl). Produces the parallel-S3 streamer that nsrestore
-# prefers over the Go single-stream one. Only built when the placeholder
-# target (which COPYs from it) is built.
+# Stage: NIXL OBJ streamer builder - Pipeline C C++ streamer (parallel S3)
+# Builds a self-consistent NIXL OBJ stack from source: aws-sdk-cpp (s3 + s3-crt
+# CRT client) + the vendored NIXL fork (OBJ plugin with crtThroughputGbps),
+# then compiles criu-stream-fetch against it. All three built in one stage on
+# the runtime base so libstdc++/glibc match the placeholder. The OBJ plugin's
+# CRT engine gives high-throughput multipart S3 downloads (~25 Gbps) that the
+# Go single-stream s5cmd streamer (~2 Gbps) cannot.
+# Recipe from nixl src/plugins/obj/README.md (aws-sdk-cpp 1.11.581, s3;s3-crt)
+# and the working build_obj config (-Denable_plugins=POSIX,OBJ).
 # =============================================================================
-FROM ${BASE_IMAGE} AS cpp-streamer-builder
+FROM ${BASE_IMAGE} AS nixl-obj-builder
 ARG BASE_IMAGE
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ make \
+    build-essential cmake git ninja-build meson pkg-config ca-certificates \
+    libcurl4-openssl-dev libssl-dev uuid-dev zlib1g-dev libasio-dev \
     && rm -rf /var/lib/apt/lists/*
-WORKDIR /build
-COPY cmd/criu-stream-fetch-cpp/ ./
-RUN cmake -S . -B build \
-        -DNIXL_INCLUDE_DIR=/opt/nvidia/nvda_nixl/include \
-        -DNIXL_LIBRARY=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/libnixl.so \
+
+# aws-sdk-cpp: s3 (standard client) + s3-crt (Common Runtime, high throughput)
+RUN git clone --recurse-submodules --depth 1 --shallow-submodules \
+        https://github.com/aws/aws-sdk-cpp.git --branch 1.11.581 /src/aws-sdk-cpp \
+    && cmake -S /src/aws-sdk-cpp -B /src/aws_build -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_ONLY="s3;s3-crt" -DENABLE_TESTING=OFF -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build /src/aws_build -j"$(nproc)" \
+    && cmake --install /src/aws_build \
+    && rm -rf /src/aws-sdk-cpp /src/aws_build
+
+# NIXL fork (POSIX + OBJ plugins only). Vendored source (fork ref 8c0ba47 with
+# crtThroughputGbps/networkInterfaceNames tunables is local-only, not on a
+# public remote). abseil/asio resolve from vendored subprojects offline.
+COPY third_party/nixl-src /src/nixl
+RUN cd /src/nixl \
+    && meson setup build --prefix=/usr/local --libdir=lib/x86_64-linux-gnu \
+        -Denable_plugins=POSIX,OBJ -Dbuild_tests=false -Dbuild_examples=false \
+        -Dbuildtype=release -Dnixl_snapshot_no_cuda=true \
+    && ninja -C build \
+    && meson install -C build \
+    && ldconfig
+
+# criu-stream-fetch against the freshly built, self-consistent NIXL
+COPY cmd/criu-stream-fetch-cpp/ /src/streamer/
+RUN cd /src/streamer \
+    && cmake -S . -B build \
+        -DNIXL_INCLUDE_DIR=/usr/local/include/nixl \
+        -DNIXL_LIBRARY=/usr/local/lib/x86_64-linux-gnu/libnixl.so \
     && cmake --build build -j"$(nproc)" \
     && cp build/criu-stream-fetch /criu-stream-fetch-cpp \
-    && /criu-stream-fetch-cpp 2>&1 | grep -qi "manifest" || true
+    && echo "=== streamer links ===" && ldd /criu-stream-fetch-cpp | grep -iE "nixl|aws|not found" \
+    && echo "=== OBJ plugin path ===" && find /usr/local -name libplugin_OBJ.so
 
 # =============================================================================
 # Stage: Placeholder - Runtime-compatible restore image (requires BASE_IMAGE arg)
@@ -436,12 +466,20 @@ RUN chmod +x /usr/local/bin/nsrestore
 COPY --from=builder /criu-stream-fetch /usr/local/sbin/criu-stream-fetch
 RUN chmod +x /usr/local/sbin/criu-stream-fetch
 
-# Copy the C++ NIXL OBJ streamer (parallel S3, ~10-26 Gbps). nsrestore
-# prefers this over the Go single-stream streamer when present. Links the
-# NIXL runtime already bundled in the vLLM base (/opt/nvidia/nvda_nixl).
-COPY --from=cpp-streamer-builder /criu-stream-fetch-cpp /usr/local/sbin/criu-stream-fetch-cpp
+# Copy the C++ NIXL OBJ streamer (parallel S3, CRT engine ~25 Gbps) + its
+# self-consistent NIXL/aws-sdk runtime built in nixl-obj-builder. nsrestore
+# prefers this over the Go single-stream streamer when present. Shipped under
+# /opt/nixl-runtime so it can't collide with the base's fragmented NIXL.
+COPY --from=nixl-obj-builder /criu-stream-fetch-cpp /usr/local/sbin/criu-stream-fetch-cpp
+COPY --from=nixl-obj-builder /usr/local/lib /opt/nixl-runtime/lib
 RUN chmod +x /usr/local/sbin/criu-stream-fetch-cpp \
-    && /usr/local/sbin/criu-stream-fetch-cpp 2>&1 | grep -q "manifest" || true
+    && printf '%s\n' /opt/nixl-runtime/lib /opt/nixl-runtime/lib/x86_64-linux-gnu \
+        > /etc/ld.so.conf.d/nixl-runtime.conf \
+    && ldconfig \
+    && echo "=== OBJ plugin ===" && find /opt/nixl-runtime -name libplugin_OBJ.so \
+    && echo "=== streamer ldd ===" \
+    && ( ldd /usr/local/sbin/criu-stream-fetch-cpp | grep -qi "not found" \
+         && echo "WARN: unresolved NIXL libs" || echo "NIXL libs resolved" )
 
 # Create directories
 RUN mkdir -p /checkpoints /var/run/criu /var/criu-work
