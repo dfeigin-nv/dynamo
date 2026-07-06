@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -129,6 +130,21 @@ func sendPrivateAck(sock int) error {
 	_, err := unix.Write(sock, []byte{'A'})
 	if err != nil {
 		return fmt.Errorf("sendAck: %w", err)
+	}
+	return nil
+}
+
+// sendPrivateFdsAsync sends [pages_memfd, pipe_rfd] as a single SCM_RIGHTS
+// message (Step A async overlap). Matches criu/mem.c:recv_streamer_private_fd
+// when opts.stream_restore_async != 0, which calls recv_fds(sock, fds, 2).
+// fds[0] is the memfd, fds[1] is the read end of the readiness pipe. CRIU's
+// PIE blocks on read(pipe_rfd) before consuming the memfd; the streamer
+// writes one byte to the write end once the fill completes (or closes it on
+// error, so PIE sees EOF and aborts).
+func sendPrivateFdsAsync(sock, pagesFd, pipeRfd int) error {
+	rights := unix.UnixRights(pagesFd, pipeRfd)
+	if err := unix.Sendmsg(sock, []byte{0}, rights, nil, 0); err != nil {
+		return fmt.Errorf("sendmsg private fds (async): %w", err)
 	}
 	return nil
 }
@@ -336,6 +352,13 @@ func main() {
 		memfd int
 		done  chan error
 	}
+	// Step A async overlap (default on). When enabled the streamer hands
+	// CRIU [memfd, pipe_rfd] + an immediate 'A' ack so CRIU's prep/fork
+	// overlaps the still-running S3 fill; a per-task goroutine writes the
+	// pipe once the fill completes. Kill switch: STREAM_RESTORE_ASYNC=0
+	// (must match criu's --no-stream-restore-async).
+	asyncEnabled := os.Getenv("STREAM_RESTORE_ASYNC") != "0"
+	var asyncWG sync.WaitGroup
 	states := make(map[uint32]*privateState, len(m.PrivateRanges))
 	if len(m.PrivateRanges) > 0 {
 		for i := range m.PrivateRanges {
@@ -385,23 +408,67 @@ func main() {
 				os.Exit(1)
 			}
 
-			if err := sendPrivateFd(privateSock, st.memfd); err != nil {
-				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-				poisonAbort(abortFd)
-				os.Exit(1)
+			if asyncEnabled {
+				// Overlap: send [memfd, pipe_rfd] + ack now, before the
+				// fill finishes. A goroutine writes the pipe when the fill
+				// completes so PIE (blocked on read(pipe_rfd)) proceeds.
+				var p [2]int
+				if err := unix.Pipe2(p[:], unix.O_CLOEXEC); err != nil {
+					fmt.Fprintf(os.Stderr, "criu-stream-fetch: pipe2 id=%d: %v\n", id, err)
+					poisonAbort(abortFd)
+					os.Exit(1)
+				}
+				pipeR, pipeW := p[0], p[1]
+				if err := sendPrivateFdsAsync(privateSock, st.memfd, pipeR); err != nil {
+					fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+					poisonAbort(abortFd)
+					os.Exit(1)
+				}
+				if err := sendPrivateAck(privateSock); err != nil {
+					fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+					poisonAbort(abortFd)
+					os.Exit(1)
+				}
+				unix.Close(pipeR) // CRIU holds its own dup
+				asyncWG.Add(1)
+				go func(id uint32, st *privateState, pipeW int) {
+					defer asyncWG.Done()
+					err := <-st.done
+					if err != nil {
+						// Fill failed: close pipe without writing so PIE's
+						// read returns EOF and it aborts cleanly.
+						fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill id=%d: %v\n", id, err)
+						unix.Close(pipeW)
+						unix.Close(st.memfd)
+						poisonAbort(abortFd)
+						return
+					}
+					if _, werr := unix.Write(pipeW, []byte{'1'}); werr != nil {
+						fmt.Fprintf(os.Stderr, "criu-stream-fetch: pipe signal id=%d: %v\n", id, werr)
+					}
+					unix.Close(pipeW)
+					unix.Close(st.memfd)
+				}(id, st, pipeW)
+				delete(states, id) // goroutine owns memfd + done from here
+			} else {
+				if err := sendPrivateFd(privateSock, st.memfd); err != nil {
+					fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+					poisonAbort(abortFd)
+					os.Exit(1)
+				}
+				if err := <-st.done; err != nil {
+					fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill id=%d: %v\n", id, err)
+					poisonAbort(abortFd)
+					os.Exit(1)
+				}
+				if err := sendPrivateAck(privateSock); err != nil {
+					fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
+					poisonAbort(abortFd)
+					os.Exit(1)
+				}
+				unix.Close(st.memfd)
+				delete(states, id)
 			}
-			if err := <-st.done; err != nil {
-				fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill id=%d: %v\n", id, err)
-				poisonAbort(abortFd)
-				os.Exit(1)
-			}
-			if err := sendPrivateAck(privateSock); err != nil {
-				fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
-				poisonAbort(abortFd)
-				os.Exit(1)
-			}
-			unix.Close(st.memfd)
-			delete(states, id)
 		}
 		// Drain any prefetch goroutines CRIU never claimed (e.g. the
 		// task exited early). Best-effort: close memfds to release tmpfs.
@@ -410,6 +477,10 @@ func main() {
 			unix.Close(st.memfd)
 			delete(states, id)
 		}
+		// Async overlap: CRIU closes the private socket after handover,
+		// but PIE reads the readiness pipes later. Stay alive until every
+		// fill goroutine has signalled its pipe.
+		asyncWG.Wait()
 		fmt.Fprintf(os.Stderr, "[stream] private loop done\n")
 	}
 
