@@ -558,8 +558,7 @@ bool setupNixlObjAgents(size_t n,
     agents_out.reserve(n);
     backends_out.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        nixlAgentConfig cfg;
-        cfg.useProgThread = true;
+        nixlAgentConfig cfg(/*use_prog_thread=*/true);
         auto name = streamerAgentName(i);
         auto agent = std::make_unique<nixlAgent>(name, cfg);
 

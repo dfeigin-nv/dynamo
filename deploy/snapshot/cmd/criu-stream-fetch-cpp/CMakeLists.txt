@@ -22,6 +22,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(NIXL_INCLUDE_DIR "/usr/local/include/nixl" CACHE PATH "Path to NIXL public headers (nixl.h)")
 set(NIXL_LIBRARY "/usr/local/lib/libnixl.so" CACHE FILEPATH "Path to libnixl.so")
+# NIXL's symbols are split across sibling libs (descriptor lists, serdes,
+# stream, common). Point NIXL_LIB_DIR at the directory holding them so we
+# link the full set; matches what the runtime binary loads via ldd.
+get_filename_component(_nixl_lib_dir "${NIXL_LIBRARY}" DIRECTORY)
+set(NIXL_LIB_DIR "${_nixl_lib_dir}" CACHE PATH "Directory with libnixl*.so siblings")
 
 add_executable(criu-stream-fetch main.cpp)
 
@@ -33,6 +38,10 @@ target_include_directories(criu-stream-fetch
 target_link_libraries(criu-stream-fetch
     PRIVATE
         ${NIXL_LIBRARY}
+        ${NIXL_LIB_DIR}/libnixl_common.so
+        ${NIXL_LIB_DIR}/libnixl_build.so
+        ${NIXL_LIB_DIR}/libserdes.so
+        ${NIXL_LIB_DIR}/libstream.so
         pthread
         dl
         rt

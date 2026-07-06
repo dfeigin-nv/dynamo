@@ -286,6 +286,28 @@ USER root
 ENTRYPOINT ["/usr/local/bin/snapshot-agent"]
 
 # =============================================================================
+# Stage: CPP streamer builder - Pipeline C NIXL OBJ streamer
+# Built against the NIXL runtime bundled in the vLLM base image
+# (/opt/nvidia/nvda_nixl). Produces the parallel-S3 streamer that nsrestore
+# prefers over the Go single-stream one. Only built when the placeholder
+# target (which COPYs from it) is built.
+# =============================================================================
+FROM ${BASE_IMAGE} AS cpp-streamer-builder
+ARG BASE_IMAGE
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake g++ make \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY cmd/criu-stream-fetch-cpp/ ./
+RUN cmake -S . -B build \
+        -DNIXL_INCLUDE_DIR=/opt/nvidia/nvda_nixl/include \
+        -DNIXL_LIBRARY=/opt/nvidia/nvda_nixl/lib/x86_64-linux-gnu/libnixl.so \
+    && cmake --build build -j"$(nproc)" \
+    && cp build/criu-stream-fetch /criu-stream-fetch-cpp \
+    && /criu-stream-fetch-cpp 2>&1 | grep -qi "manifest" || true
+
+# =============================================================================
 # Stage: Placeholder - Runtime-compatible restore image (requires BASE_IMAGE arg)
 # This image is a superset of the runtime image: same default execution contract
 # (entrypoint/cmd/user), plus CRIU/cuda-checkpoint tooling for external restore.
@@ -413,6 +435,13 @@ RUN chmod +x /usr/local/bin/nsrestore
 # Copy Pipeline C streamer (spawned by nsrestore when STREAM_MODE=c).
 COPY --from=builder /criu-stream-fetch /usr/local/sbin/criu-stream-fetch
 RUN chmod +x /usr/local/sbin/criu-stream-fetch
+
+# Copy the C++ NIXL OBJ streamer (parallel S3, ~10-26 Gbps). nsrestore
+# prefers this over the Go single-stream streamer when present. Links the
+# NIXL runtime already bundled in the vLLM base (/opt/nvidia/nvda_nixl).
+COPY --from=cpp-streamer-builder /criu-stream-fetch-cpp /usr/local/sbin/criu-stream-fetch-cpp
+RUN chmod +x /usr/local/sbin/criu-stream-fetch-cpp \
+    && /usr/local/sbin/criu-stream-fetch-cpp 2>&1 | grep -q "manifest" || true
 
 # Create directories
 RUN mkdir -p /checkpoints /var/run/criu /var/criu-work

@@ -139,12 +139,18 @@ func spawnPipelineCStreamer(manifest string, log logr.Logger) (*exec.Cmd, *os.Fi
 	streamerEnd := os.NewFile(uintptr(pair[0]), "stream-priv-streamer")
 	swrkEnd := os.NewFile(uintptr(pair[1]), "stream-priv-swrk")
 
-	const streamerBin = "/usr/local/sbin/criu-stream-fetch"
+	// Prefer the C++ NIXL OBJ streamer (parallel S3, ~10-26 Gbps) when
+	// present; fall back to the Go single-stream s5cmd streamer otherwise.
+	streamerBin := "/usr/local/sbin/criu-stream-fetch-cpp"
+	if _, err := os.Stat(streamerBin); err != nil {
+		streamerBin = "/usr/local/sbin/criu-stream-fetch"
+	}
 	if _, err := os.Stat(streamerBin); err != nil {
 		streamerEnd.Close()
 		swrkEnd.Close()
 		return nil, nil, fmt.Errorf("streamer binary missing: %w", err)
 	}
+	log.Info("Pipeline C streamer binary", "bin", streamerBin)
 
 	cmd := exec.Command(streamerBin, "--manifest", manifest)
 	cmd.Env = append(os.Environ(), "CRIU_STREAMER_PRIVATE_SOCK=3")
