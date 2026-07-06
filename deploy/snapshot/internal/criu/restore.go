@@ -42,7 +42,10 @@ const PagesS3IndexFilename = "pages-s3-index.json"
 // index.json exists the private_ranges sources are s3:// URIs (Stage 1
 // of streaming-c-mvp: streamer fetches pages directly from S3). Otherwise
 // it walks checkpointPath for pages-*.img and emits on-disk paths.
-func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
+// Returns (manifestPath, s3Sources, error). s3Sources is true when the
+// ranges are s3:// URIs (NIXL OBJ streamer applies); false for on-disk paths
+// (local/juicefs restore — only the Go streamer can pread local files).
+func writePipelineCManifest(checkpointPath, workDir string) (string, bool, error) {
 	type rangeEntry struct {
 		ID     uint32 `json:"id"`
 		Size   uint64 `json:"size"`
@@ -51,13 +54,15 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 		Key    string `json:"key,omitempty"`
 	}
 	var priv []rangeEntry
+	s3Sources := false
 
 	idxPath := filepath.Join(checkpointPath, PagesS3IndexFilename)
 	if idxBytes, err := os.ReadFile(idxPath); err == nil {
 		var idx pagesS3Index
 		if err := json.Unmarshal(idxBytes, &idx); err != nil {
-			return "", fmt.Errorf("parse %s: %w", idxPath, err)
+			return "", false, fmt.Errorf("parse %s: %w", idxPath, err)
 		}
+		s3Sources = true
 		for _, p := range idx.Pages {
 			src := fmt.Sprintf("s3://%s/%s", idx.Bucket, p.Key)
 			priv = append(priv, rangeEntry{
@@ -69,11 +74,11 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 			})
 		}
 	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("read %s: %w", idxPath, err)
+		return "", false, fmt.Errorf("read %s: %w", idxPath, err)
 	} else {
 		entries, err := os.ReadDir(checkpointPath)
 		if err != nil {
-			return "", fmt.Errorf("readdir %s: %w", checkpointPath, err)
+			return "", false, fmt.Errorf("readdir %s: %w", checkpointPath, err)
 		}
 		for _, e := range entries {
 			name := e.Name()
@@ -88,7 +93,7 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 			src := filepath.Join(checkpointPath, name)
 			info, err := os.Stat(src)
 			if err != nil {
-				return "", fmt.Errorf("stat %s: %w", src, err)
+				return "", false, fmt.Errorf("stat %s: %w", src, err)
 			}
 			priv = append(priv, rangeEntry{ID: id, Size: uint64(info.Size()), Source: src})
 		}
@@ -98,7 +103,7 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 		workDir = checkpointPath
 	}
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
-		return "", err
+		return "", false, err
 	}
 	out := filepath.Join(workDir, "pipeline-c-manifest.json")
 	body := []byte(`{"shmem_ranges":[],"private_ranges":[`)
@@ -119,9 +124,9 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 	}
 	body = append(body, []byte("]}")...)
 	if err := os.WriteFile(out, body, 0o644); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return out, nil
+	return out, s3Sources, nil
 }
 
 // spawnPipelineCStreamer forks the criu-stream-fetch binary with one end
@@ -131,7 +136,7 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 // Streamer fd 3 (its private socket end) is non-CLOEXEC so it survives
 // exec; the swrk end has CLOEXEC stripped only on the way into criu
 // (handled by go-criu's ExtraFiles plumbing).
-func spawnPipelineCStreamer(manifest string, log logr.Logger) (*exec.Cmd, *os.File, error) {
+func spawnPipelineCStreamer(manifest string, s3Sources bool, log logr.Logger) (*exec.Cmd, *os.File, error) {
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, nil, fmt.Errorf("socketpair: %w", err)
@@ -139,18 +144,25 @@ func spawnPipelineCStreamer(manifest string, log logr.Logger) (*exec.Cmd, *os.Fi
 	streamerEnd := os.NewFile(uintptr(pair[0]), "stream-priv-streamer")
 	swrkEnd := os.NewFile(uintptr(pair[1]), "stream-priv-swrk")
 
-	// Prefer the C++ NIXL OBJ streamer (parallel S3, ~10-26 Gbps) when
-	// present; fall back to the Go single-stream s5cmd streamer otherwise.
-	streamerBin := "/usr/local/sbin/criu-stream-fetch-cpp"
-	if _, err := os.Stat(streamerBin); err != nil {
-		streamerBin = "/usr/local/sbin/criu-stream-fetch"
+	// Pick the streamer by source type. The C++ NIXL OBJ streamer does
+	// parallel-multipart S3 (~37 Gbps) but is S3-only (it requires an s3://
+	// bucket per range). Local/juicefs restores use on-disk paths, which
+	// only the Go streamer can pread into the memfd. Fall back to the Go
+	// streamer if the C++ one is absent.
+	cppBin := "/usr/local/sbin/criu-stream-fetch-cpp"
+	goBin := "/usr/local/sbin/criu-stream-fetch"
+	streamerBin := goBin
+	if s3Sources {
+		if _, err := os.Stat(cppBin); err == nil {
+			streamerBin = cppBin
+		}
 	}
 	if _, err := os.Stat(streamerBin); err != nil {
 		streamerEnd.Close()
 		swrkEnd.Close()
 		return nil, nil, fmt.Errorf("streamer binary missing: %w", err)
 	}
-	log.Info("Pipeline C streamer binary", "bin", streamerBin)
+	log.Info("Pipeline C streamer binary", "bin", streamerBin, "s3_sources", s3Sources)
 
 	cmd := exec.Command(streamerBin, "--manifest", manifest)
 	cmd.Env = append(os.Environ(), "CRIU_STREAMER_PRIVATE_SOCK=3")
@@ -262,11 +274,11 @@ func ExecuteRestore(
 	// cross-ns fd passing is unnecessary.
 	var streamer *exec.Cmd
 	if criuOpts.GetStreamRestore() {
-		manifest, err := writePipelineCManifest(checkpointPath, settings.WorkDir)
+		manifest, s3Sources, err := writePipelineCManifest(checkpointPath, settings.WorkDir)
 		if err != nil {
 			return 0, fmt.Errorf("Pipeline C manifest: %w", err)
 		}
-		s, sockSwrk, err := spawnPipelineCStreamer(manifest, log)
+		s, sockSwrk, err := spawnPipelineCStreamer(manifest, s3Sources, log)
 		if err != nil {
 			return 0, fmt.Errorf("Pipeline C streamer spawn: %w", err)
 		}
