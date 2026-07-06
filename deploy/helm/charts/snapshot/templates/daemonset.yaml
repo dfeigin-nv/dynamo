@@ -112,6 +112,17 @@ spec:
                   fieldPath: spec.nodeName
             - name: SNAPSHOT_LOG_LEVEL
               value: {{ .Values.daemonset.snapshotLogLevel | quote }}
+            # Node-local memfd content cache. Orthogonal to storage.type — the
+            # HIT path borrows already-filled memfds across restores on the
+            # same node (warm ~4.5s vs cold ~13s). See values.yaml memfdCache.
+            - name: MEMFD_CACHE_ENABLED
+              value: {{ ternary "1" "0" (default false .Values.memfdCache.enabled) | quote }}
+            - name: MEMFD_CACHE_MAX_BYTES
+              value: {{ .Values.memfdCache.maxBytes | default 0 | quote }}
+            # allowUnsealed = the writable "ceiling" HIT path (accepts
+            # F_SEAL_SEAL donations). Required for the proven restore+inference.
+            - name: MEMFD_CACHE_ALLOW_UNSEALED
+              value: {{ ternary "1" "0" (default false .Values.memfdCache.allowUnsealed) | quote }}
             {{- if eq .Values.storage.type "s3" }}
             # S3_DIRECT routes the dump/restore between two S3 paths:
             #   "1" — direct path (internal/criu/streams3/direct.go): s5cmd

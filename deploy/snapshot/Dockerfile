@@ -22,13 +22,12 @@ ARG GO_VERSION=1.26.3
 #   --build-arg CRIU_REPO=<git-remote-url>
 #   --build-arg CRIU_REF=<fork-branch-or-sha>
 ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
-# streaming-restore-pipeline-c is add-aio-and-parallel-memfd + 8 Phase-4
-# commits adding the --stream-restore opt-in flag (memfd handover via
-# SCM_RIGHTS, UFFDIO_REGISTER_MODE_MINOR + UFFDIO_CONTINUE, PIE futex_wait).
-# Without --stream-restore, CRIU behaves identically to the base branch —
-# this lets Pipeline A continue working unchanged while Pipeline C builds
-# on the same image.
-ARG CRIU_REF=streaming-restore-pipeline-c
+# memfd-cache-ceiling-test is the shipped memfd-cache HIT path: node-local
+# content cache (donate/borrow of writable MAP_SHARED memfds over SCM_RIGHTS)
+# + coordinator-parallel restore. No streaming commits. Warm HIT restores in
+# ~4.5s; cold MISS ~13s. Streaming (Pipeline C) stays dormant on the
+# snapshot-s3-memfd-juicefs-streaming branch for later reconciliation.
+ARG CRIU_REF=memfd-cache-ceiling-test
 
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
@@ -112,7 +111,7 @@ ARG CRIU_REF
 # Pass --build-arg CRIU_CACHE_BUST=$(date +%s) to force a fresh git fetch
 # when the upstream branch has new commits but ${CRIU_REF} string is
 # unchanged.
-ARG CRIU_CACHE_BUST=11
+ARG CRIU_CACHE_BUST=12
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \

@@ -158,6 +158,22 @@ daemonset:
     # Busybox image for seccomp profile deployment
     image: busybox:latest
 
+# Node-local memfd content cache (deploy/snapshot/internal/memfdcache).
+# Orthogonal to storage.type — a second restore of the same checkpoint on the
+# same node borrows the already-filled memfd over SCM_RIGHTS instead of
+# re-reading pages. Warm HIT restores ~4.5s vs ~13s cold MISS. The daemonset
+# template wires the three env vars below; the agent reads them at runtime.
+memfdCache:
+  # MEMFD_CACHE_ENABLED — hold populated memfds across restores.
+  enabled: true
+  # MEMFD_CACHE_MAX_BYTES — cap on total cached bytes; 0 = unbounded.
+  maxBytes: 0
+  # MEMFD_CACHE_ALLOW_UNSEALED — accept writable (F_SEAL_SEAL, MAP_SHARED)
+  # donations, not just F_SEAL_FUTURE_WRITE. This is the proven HIT
+  # restore+inference "ceiling" path. Cross-pod / re-sleep reuse is unsafe
+  # with this on, so it pairs with single-pod-per-node warm restore.
+  allowUnsealed: true
+
 # Seccomp profile configuration
 # CRIU can't checkpoint io_uring; this gates the block-iouring ConfigMap and
 # the initContainer that writes the profile. Set to false on RHCOS 9.6+, which
