@@ -10,6 +10,29 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
 )
 
+func TestParseImageIoMode(t *testing.T) {
+	tests := []struct {
+		raw     string
+		want    criurpc.CriuImageIoMode
+		wantErr bool
+	}{
+		{raw: "", want: criurpc.CriuImageIoMode_IMAGE_IO_DIRECT},
+		{raw: "direct", want: criurpc.CriuImageIoMode_IMAGE_IO_DIRECT},
+		{raw: "DIRECT", want: criurpc.CriuImageIoMode_IMAGE_IO_DIRECT},
+		{raw: " writeback ", want: criurpc.CriuImageIoMode_IMAGE_IO_WRITEBACK},
+		{raw: "bogus", want: criurpc.CriuImageIoMode_IMAGE_IO_WRITEBACK, wantErr: true},
+	}
+	for _, tt := range tests {
+		got, err := parseImageIoMode(tt.raw)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("parseImageIoMode(%q) err = %v, wantErr %v", tt.raw, err, tt.wantErr)
+		}
+		if got != tt.want {
+			t.Errorf("parseImageIoMode(%q) = %v, want %v", tt.raw, got, tt.want)
+		}
+	}
+}
+
 func TestParseManageCgroupsMode(t *testing.T) {
 	tests := []struct {
 		raw      string

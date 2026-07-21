@@ -35,7 +35,6 @@ require (
 	github.com/AdamKorcz/go-118-fuzz-build v0.0.0-20230306123547-8075edf89bb0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/Microsoft/hcsshim v0.11.7 // indirect
-	github.com/aperturerobotics/protobuf-go-lite v0.15.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -126,4 +125,4 @@ require (
 
 replace github.com/ai-dynamo/dynamo/deploy/operator => ../operator
 
-replace github.com/checkpoint-restore/go-criu/v8 => github.com/dfeigin-nv/go-criu/v8 v8.1.1-0.20260608103404-d4c4a5d12f90
+replace github.com/checkpoint-restore/go-criu/v8 => github.com/dfeigin-nv/go-criu/v8 v8.1.1-0.20260721092300-5260b9838693

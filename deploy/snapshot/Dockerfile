@@ -28,7 +28,7 @@ ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
 # + coordinator-parallel restore. No streaming commits. Warm HIT restores in
 # ~4.5s; cold MISS ~13s. Streaming (Pipeline C) stays dormant on the
 # snapshot-s3-memfd-juicefs-streaming branch for later reconciliation.
-ARG CRIU_REF=memfd-cache-ceiling-test
+ARG CRIU_REF=imageio-on-memfd
 
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
