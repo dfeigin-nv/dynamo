@@ -4,6 +4,7 @@ package types
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +18,26 @@ type AgentConfig struct {
 	Overlay             OverlaySettings `yaml:"overlay"`
 	Restore             RestoreSpec     `yaml:"restore"`
 	CRIU                CRIUSettings    `yaml:"criu"`
+	MemfdCache          MemfdCacheSpec  `yaml:"memfdCache"`
+}
+
+// MemfdCacheSpec configures the node-local memfd content cache. Off by default
+// so it ships dark; enable per-deployment once validated.
+type MemfdCacheSpec struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxBytes caps resident cached memfd bytes on the node (0 = unlimited).
+	// Holding a populated memfd pins RAM, so this is the main operational knob.
+	MaxBytes int64 `yaml:"maxBytes"`
+	// IdleTTLSeconds evicts cold (unborrowed) entries after this long (0 = none).
+	IdleTTLSeconds int `yaml:"idleTTLSeconds"`
+}
+
+// IdleTTL returns the configured idle eviction interval.
+func (m *MemfdCacheSpec) IdleTTL() time.Duration {
+	if m.IdleTTLSeconds <= 0 {
+		return 0
+	}
+	return time.Duration(m.IdleTTLSeconds) * time.Second
 }
 
 const (
@@ -35,6 +56,19 @@ func (c *AgentConfig) LoadEnvOverrides() {
 	if v := os.Getenv("RESTRICTED_NAMESPACE"); v != "" {
 		c.RestrictedNamespace = v
 	}
+	if v := os.Getenv("MEMFD_CACHE_ENABLED"); v != "" {
+		c.MemfdCache.Enabled = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("MEMFD_CACHE_MAX_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.MemfdCache.MaxBytes = n
+		}
+	}
+	if v := os.Getenv("MEMFD_CACHE_IDLE_TTL_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.MemfdCache.IdleTTLSeconds = n
+		}
+	}
 }
 
 func (c *AgentConfig) Validate() error {
@@ -42,17 +76,29 @@ func (c *AgentConfig) Validate() error {
 	if storageType == "" {
 		storageType = "pvc"
 	}
-	if storageType != "pvc" {
-		return &ConfigError{Field: "storage.type", Message: fmt.Sprintf("unsupported storage type %q; only pvc is implemented today", storageType)}
+	switch storageType {
+	case "pvc":
+		basePath := strings.TrimSpace(c.Storage.BasePath)
+		if basePath == "" {
+			return &ConfigError{Field: "storage.basePath", Message: "storage.basePath is required when storage.type is pvc"}
+		}
+		if !strings.HasPrefix(basePath, "/") {
+			return &ConfigError{Field: "storage.basePath", Message: "storage.basePath must be an absolute path"}
+		}
+		c.Storage.BasePath = basePath
+	case "s3":
+		s3URI := strings.TrimSpace(c.Storage.S3URI)
+		if s3URI == "" {
+			return &ConfigError{Field: "storage.s3.uri", Message: "storage.s3.uri is required when storage.type is s3"}
+		}
+		if !strings.HasPrefix(s3URI, "s3://") {
+			return &ConfigError{Field: "storage.s3.uri", Message: fmt.Sprintf("storage.s3.uri %q must begin with s3://", s3URI)}
+		}
+		c.Storage.S3URI = s3URI
+	default:
+		return &ConfigError{Field: "storage.type", Message: fmt.Sprintf("unsupported storage type %q; expected pvc or s3", storageType)}
 	}
-	basePath := strings.TrimSpace(c.Storage.BasePath)
-	if basePath == "" {
-		return &ConfigError{Field: "storage.basePath", Message: "storage.basePath is required"}
-	}
-	if !strings.HasPrefix(basePath, "/") {
-		return &ConfigError{Field: "storage.basePath", Message: "storage.basePath must be an absolute path"}
-	}
-	c.Storage.BasePath = basePath
+	c.Storage.Type = storageType
 	accessMode := strings.TrimSpace(c.Storage.AccessMode)
 	if accessMode == "" {
 		accessMode = StorageAccessModeAgentMount
@@ -88,6 +134,9 @@ type StorageSpec struct {
 	Type       string `yaml:"type"`
 	BasePath   string `yaml:"basePath"`
 	AccessMode string `yaml:"accessMode"`
+
+	// S3URI is the s3://bucket/prefix root for S3 storage. Required when Type is "s3".
+	S3URI string `yaml:"s3URI"`
 }
 
 // RestoreSpec holds settings for the CRIU restore process.

@@ -15,6 +15,7 @@ import (
 
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/controller"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/logging"
+	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/memfdcache"
 	snapshotruntime "github.com/ai-dynamo/dynamo/deploy/snapshot/internal/runtime"
 )
 
@@ -57,8 +58,18 @@ func main() {
 		"runtime", *runtimeType,
 	)
 
+	// Node-local memfd content cache (off by default; ships dark). Held open
+	// for the DaemonSet lifetime so it outlives any single restore.
+	var memfdCache *memfdcache.Server
+	if cfg.MemfdCache.Enabled {
+		memfdCache = memfdcache.New(cfg.MemfdCache.MaxBytes, cfg.MemfdCache.IdleTTL(), rootLog.WithName("memfd-cache"))
+		defer memfdCache.Close()
+		agentLog.Info("Node-local memfd content cache enabled",
+			"max_bytes", cfg.MemfdCache.MaxBytes, "idle_ttl", cfg.MemfdCache.IdleTTL())
+	}
+
 	// The node controller handles both restore and capture paths.
-	nodeController, err := controller.NewNodeController(cfg, rt, rootLog.WithName("controller"))
+	nodeController, err := controller.NewNodeController(cfg, rt, memfdCache, rootLog.WithName("controller"))
 	if err != nil {
 		fatal(agentLog, err, "Failed to create snapshot node controller")
 	}

@@ -1,6 +1,8 @@
 # Binaries
 bin/
 *.exe
+# compiled test server for internal/memfdcache (build artifact)
+/memfdcache-testserve
 
 # Build artifacts
 *.o

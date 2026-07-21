@@ -30,8 +30,10 @@ openshift:
 
 # Storage configuration for checkpoints
 storage:
-  # Storage type stays snapshot-owned for future backend expansion.
-  # Only pvc is implemented today.
+  # Storage backend: "pvc" (default) writes through a ReadWriteMany PVC
+  # mounted into the snapshot-agent DaemonSet; "s3" streams CRIU images,
+  # rootfs-diff, and deleted-files directly to/from S3 via the agent's
+  # criu-image-streamer pipeline (no shared PVC required).
   type: pvc
 
   # How snapshot-agent accesses checkpoint storage:
@@ -67,9 +69,39 @@ storage:
     # into checkpoint/restore workload pods at the same path.
     basePath: /checkpoints
 
-  # Reserved for future snapshot-owned backends. Unsupported today.
+  # S3 backend configuration (when type=s3).
+  # Required: uri is the bucket+prefix root (e.g. s3://my-bucket/checkpoints).
+  # Per-checkpoint shards land at <uri>/<checkpointID>/versions/<v>/img-*(.lz4).
+  # credentialsSecretRef references a Secret with AWS_ACCESS_KEY_ID /
+  # AWS_SECRET_ACCESS_KEY / AWS_REGION (or IRSA equivalents) — daemonset.yaml
+  # mounts it as envFrom on the agent container.
+  # shardLZ4 toggles per-shard lz4 compression. false (default) ships raw
+  # CRIU image bytes and surfaces shards as img-* (no .lz4 suffix). true
+  # enables lz4. The agent reads S3_SHARD_LZ4 at runtime; the daemonset
+  # template wires it from this value. Only consulted on the streaming
+  # path (storage.s3.directMode=false).
+  #
+  # directMode picks between the two S3 dump/restore implementations:
+  #   true  (default) — direct path: s5cmd materializes per-file checkpoint
+  #                     objects into a tmpfs at /run/criu-s3-images and CRIU
+  #                     reads regular files. Architecturally correct path.
+  #   false           — streaming path: criu-image-streamer pipes sharded
+  #                     stdio through s5cmd cat. Kept as a debug fallback.
+  # The agent reads the S3_DIRECT env var at runtime; the daemonset template
+  # wires it from this value (see Gate at internal/executor/checkpoint.go:369
+  # and nsrestore.go:219).
   s3:
     uri: ""
+    credentialsSecretRef: ""
+    shardLZ4: false
+    directMode: true
+    # restoreSource: when set, the agent restores from a pre-mounted FUSE
+    # checkpoint directory instead of materializing the checkpoint into a
+    # tmpfs via s5cmd. The value must include a scheme prefix and the full
+    # per-checkpoint path, e.g. "juicefs:/mnt/jfs/checkpoints/ckpt-qwen3-14b".
+    # Only consumed by ExecuteRestoreS3Direct when directMode=true.
+    # Leave empty to use the standard tmpfs+s5cmd path.
+    restoreSource: ""
 
   # Reserved for future snapshot-owned backends. Unsupported today.
   oci:
@@ -127,6 +159,22 @@ daemonset:
     image: busybox:latest
     imagePullPolicy: Always
 
+# Node-local memfd content cache (deploy/snapshot/internal/memfdcache).
+# Orthogonal to storage.type — a second restore of the same checkpoint on the
+# same node borrows the already-filled memfd over SCM_RIGHTS instead of
+# re-reading pages. Warm HIT restores ~4.5s vs ~13s cold MISS. The daemonset
+# template wires the three env vars below; the agent reads them at runtime.
+memfdCache:
+  # MEMFD_CACHE_ENABLED — hold populated memfds across restores.
+  enabled: true
+  # MEMFD_CACHE_MAX_BYTES — cap on total cached bytes; 0 = unbounded.
+  maxBytes: 0
+  # MEMFD_CACHE_ALLOW_UNSEALED — accept writable (F_SEAL_SEAL, MAP_SHARED)
+  # donations, not just F_SEAL_FUTURE_WRITE. This is the proven HIT
+  # restore+inference "ceiling" path. Cross-pod / re-sleep reuse is unsafe
+  # with this on, so it pairs with single-pod-per-node warm restore.
+  allowUnsealed: true
+
 # Seccomp profile configuration
 # CRIU can't checkpoint io_uring; this gates the block-iouring ConfigMap and
 # the initContainer that writes the profile. Set to false on RHCOS 9.6+, which
@@ -170,6 +218,14 @@ config:
       - "*/.cache/huggingface"
       - "*/__pycache__"
       - "*.pyc"
+      # HF Hub `snapshot_download` lands here whenever the loader fetches
+      # the repo (runai-model-streamer pre-fetches safetensors before
+      # streaming to GPU; see TODO investigation). Without this the model
+      # weights leak into rootfs-diff (verified 16 GB on Qwen3-8B, 1.4 GB
+      # on Qwen3-0.6B). Pattern is HF-Hub canonical so it matches both
+      # /workspace/models--<org>--<model>/ and /root/.cache/huggingface/hub/models--*/.
+      - "*/models--*"
+      - "*/.locks"
 
   restore:
     # Path to the nsrestore binary in the placeholder image

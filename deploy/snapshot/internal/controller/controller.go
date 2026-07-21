@@ -34,6 +34,7 @@ import (
 
 	nvidiacomv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1alpha1"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/executor"
+	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/memfdcache"
 	snapshotruntime "github.com/ai-dynamo/dynamo/deploy/snapshot/internal/runtime"
 	"github.com/ai-dynamo/dynamo/deploy/snapshot/internal/types"
 	snapshotprotocol "github.com/ai-dynamo/dynamo/deploy/snapshot/protocol"
@@ -54,6 +55,11 @@ type NodeController struct {
 	holderID     string
 	checkpointFn func(ctx context.Context, params CheckpointParams) error
 
+	// memfdCache is the node-local memfd content cache server, or nil when
+	// disabled. Threaded into each RestoreRequest so the executor can open a
+	// per-restore session over which CRIU borrows/donates sealed memfds.
+	memfdCache *memfdcache.Server
+
 	inFlight   map[string]struct{}
 	inFlightMu sync.Mutex
 
@@ -67,6 +73,10 @@ type NodeController struct {
 type checkpointLocations struct {
 	HostPath      string
 	ContainerPath string
+	// StorageType identifies the storage backend ("pvc" or "s3"). The agent
+	// uses this to decide whether to stat HostPath as a real filesystem path
+	// (pvc) or treat it as an S3 URI (s3).
+	StorageType string
 }
 
 const (
@@ -86,6 +96,7 @@ var podSnapshotContentGVR = nvidiacomv1alpha1.GroupVersion.WithResource("podsnap
 func NewNodeController(
 	cfg *types.AgentConfig,
 	rt snapshotruntime.Runtime,
+	memfdCache *memfdcache.Server,
 	log logr.Logger,
 ) (*NodeController, error) {
 	restConfig, err := rest.InClusterConfig()
@@ -113,15 +124,16 @@ func NewNodeController(
 	}
 
 	w := &NodeController{
-		config:    cfg,
-		clientset: clientset,
-		client:    typedClient,
-		dynClient: dynClient,
-		runtime:   rt,
-		log:       log,
-		holderID:  "snapshot-agent/" + uuid.NewString(),
-		inFlight:  make(map[string]struct{}),
-		stopCh:    make(chan struct{}),
+		config:     cfg,
+		clientset:  clientset,
+		client:     typedClient,
+		dynClient:  dynClient,
+		runtime:    rt,
+		log:        log,
+		holderID:   "snapshot-agent/" + uuid.NewString(),
+		memfdCache: memfdCache,
+		inFlight:   make(map[string]struct{}),
+		stopCh:     make(chan struct{}),
 	}
 	w.checkpointFn = w.executorCheckpoint
 	return w, nil
@@ -480,13 +492,15 @@ func (w *NodeController) startRestoreForContainer(
 		w.log.Error(err, "Restore placeholder container changed before storage access", "pod", podKey, "container", containerName)
 		return
 	}
-	checkpointReady, err := w.restoreCheckpointReady(w.log, podKey, checkpointID, checkpointLocation.HostPath)
-	if err != nil {
-		w.log.Error(err, "Restore checkpoint path is invalid", "pod", podKey, "checkpoint_id", checkpointID, "checkpoint_location", checkpointLocation.HostPath)
-		return
-	}
-	if !checkpointReady {
-		return
+	if checkpointLocation.StorageType != snapshotprotocol.StorageTypeS3 {
+		checkpointReady, err := w.restoreCheckpointReady(w.log, podKey, checkpointID, checkpointLocation.HostPath)
+		if err != nil {
+			w.log.Error(err, "Restore checkpoint path is invalid", "pod", podKey, "checkpoint_id", checkpointID, "checkpoint_location", checkpointLocation.HostPath)
+			return
+		}
+		if !checkpointReady {
+			return
+		}
 	}
 
 	restoreAttemptKey := fmt.Sprintf("%s/%s/%s", podKey, containerName, containerID)
@@ -558,12 +572,15 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 	if err != nil {
 		return fmt.Errorf("refresh restore checkpoint location: %w", err)
 	}
-	checkpointReady, err := w.restoreCheckpointReady(log, podKey, checkpointID, checkpointLocation.HostPath)
-	if err != nil {
-		return fmt.Errorf("validate refreshed checkpoint location: %w", err)
-	}
-	if !checkpointReady {
-		return nil
+	// S3 checkpoints can't be stat'd; skip the filesystem readiness probe.
+	if checkpointLocation.StorageType != snapshotprotocol.StorageTypeS3 {
+		checkpointReady, err := w.restoreCheckpointReady(log, podKey, checkpointID, checkpointLocation.HostPath)
+		if err != nil {
+			return fmt.Errorf("validate refreshed checkpoint location: %w", err)
+		}
+		if !checkpointReady {
+			return nil
+		}
 	}
 
 	if err := setRestoreStatus(snapshotprotocol.RestoreStatusInProgress); err != nil {
@@ -576,6 +593,7 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 		CheckpointLocation:          checkpointLocation.HostPath,
 		ContainerCheckpointLocation: checkpointLocation.ContainerPath,
 		ContainerID:                 containerID,
+		CheckpointStorageType:       checkpointLocation.StorageType,
 		StartedAt:                   startedAt,
 		NSRestorePath:               w.config.Restore.NSRestorePath,
 		PodName:                     pod.Name,
@@ -583,6 +601,7 @@ func (w *NodeController) runRestore(ctx context.Context, pod *corev1.Pod, contai
 		TargetPodIP:                 pod.Status.PodIP,
 		ContainerName:               containerName,
 		Clientset:                   w.clientset,
+		MemfdCache:                  w.memfdCache,
 	}
 	placeholderHostPID, err := executor.Restore(restoreCtx, w.runtime, log, req)
 	if err != nil {
@@ -709,12 +728,17 @@ func (w *NodeController) checkpointLocationsFromPod(pod *corev1.Pod, checkpointI
 	if storageType == "" {
 		storageType = w.config.Storage.Type
 	}
+	s3URI := strings.TrimSpace(pod.Annotations[snapshotprotocol.CheckpointStorageS3URIAnnotation])
+	if s3URI == "" {
+		s3URI = strings.TrimSpace(w.config.Storage.S3URI)
+	}
 	resolvedStorage, err := snapshotprotocol.ResolveCheckpointStorage(
 		checkpointID,
 		strings.TrimSpace(pod.Annotations[snapshotprotocol.CheckpointArtifactVersionAnnotation]),
 		snapshotprotocol.Storage{
 			Type:     storageType,
 			BasePath: basePath,
+			S3URI:    s3URI,
 		},
 	)
 	if err != nil {
@@ -722,6 +746,15 @@ func (w *NodeController) checkpointLocationsFromPod(pod *corev1.Pod, checkpointI
 	}
 
 	location := resolvedStorage.Location
+	// S3 locations live in object storage; there is no host-side filesystem
+	// path to validate or reroute through /host/proc/<pid>/root.
+	if resolvedStorage.Type == snapshotprotocol.StorageTypeS3 {
+		return checkpointLocations{
+			HostPath:      location,
+			ContainerPath: location,
+			StorageType:   snapshotprotocol.StorageTypeS3,
+		}, nil
+	}
 	if !filepath.IsAbs(location) || filepath.Clean(location) != location {
 		return checkpointLocations{}, fmt.Errorf("checkpoint location must be an absolute, clean path: %q", location)
 	}
@@ -735,9 +768,9 @@ func (w *NodeController) checkpointLocationsFromPod(pod *corev1.Pod, checkpointI
 			"root",
 			strings.TrimPrefix(location, string(os.PathSeparator)),
 		)
-		return checkpointLocations{HostPath: hostLocation, ContainerPath: location}, nil
+		return checkpointLocations{HostPath: hostLocation, ContainerPath: location, StorageType: snapshotprotocol.StorageTypePVC}, nil
 	}
-	return checkpointLocations{HostPath: location, ContainerPath: location}, nil
+	return checkpointLocations{HostPath: location, ContainerPath: location, StorageType: snapshotprotocol.StorageTypePVC}, nil
 }
 
 func (w *NodeController) refreshRestoreCheckpointLocation(ctx context.Context, pod *corev1.Pod, containerID string, checkpointID string, checkpointLocation checkpointLocations) (checkpointLocations, error) {
