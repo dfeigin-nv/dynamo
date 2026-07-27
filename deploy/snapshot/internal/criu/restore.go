@@ -355,16 +355,19 @@ func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroup
 
 		// STREAM_PRIVATE selects how private anonymous VMAs are
 		// restored: "mmap" (default) maps them over the streamer memfd
-		// zero-copy, "copy" reads them into anonymous memory so the
-		// VMAs re-dump as VMA_ANON_PRIVATE, at the cost of a copy and
-		// ~2x peak RSS.
+		// zero-copy; "copy" eagerly reads them into anonymous memory;
+		// "uffd" demand-pages them via UFFDIO_COPY. The latter two
+		// re-dump as VMA_ANON_PRIVATE, at the cost of a copy and ~2x
+		// peak RSS.
 		switch v := os.Getenv("STREAM_PRIVATE"); v {
 		case "", "mmap":
-			// default; leave stream_private_copy unset
+			// default; leave stream_private_mode unset
 		case "copy":
-			criuOpts.StreamPrivateCopy = proto.Bool(true)
+			criuOpts.StreamPrivateMode = criurpc.CriuStreamPrivateMode_STREAM_PRIVATE_COPY.Enum()
+		case "uffd":
+			criuOpts.StreamPrivateMode = criurpc.CriuStreamPrivateMode_STREAM_PRIVATE_UFFD.Enum()
 		default:
-			return nil, fmt.Errorf("invalid STREAM_PRIVATE=%q, want \"mmap\" or \"copy\"", v)
+			return nil, fmt.Errorf("invalid STREAM_PRIVATE=%q, want \"mmap\", \"copy\" or \"uffd\"", v)
 		}
 	}
 	criuOpts.EvasiveDevices = proto.Bool(settings.EvasiveDevices)

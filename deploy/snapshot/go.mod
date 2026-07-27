@@ -125,4 +125,4 @@ require (
 
 replace github.com/ai-dynamo/dynamo/deploy/operator => ../operator
 
-replace github.com/checkpoint-restore/go-criu/v8 => github.com/dfeigin-nv/go-criu/v8 v8.1.1-0.20260727111011-3d770b744e0d
+replace github.com/checkpoint-restore/go-criu/v8 => github.com/dfeigin-nv/go-criu/v8 v8.1.1-0.20260727112636-5a40cd36741b
