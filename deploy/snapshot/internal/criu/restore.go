@@ -365,6 +365,24 @@ func BuildRestoreOpts(m *types.CheckpointManifest, checkpointPath string, cgroup
 		case "copy":
 			criuOpts.StreamPrivateMode = criurpc.CriuStreamPrivateMode_STREAM_PRIVATE_COPY.Enum()
 		case "uffd":
+			// uffd leaves the private pages unpopulated and lets the
+			// lazy-pages daemon demand-page them. The daemon reads
+			// pages-<id>.img, NOT the streamer memfd -- it has no access
+			// to that fd, since the streamer's daemon handshake carries
+			// only shmem eventfds. But STREAM_MODE=c deliberately
+			// excludes pages-*.img from the s5cmd download (see
+			// streams3/direct.go) and leaves the bytes in S3, recording
+			// them in the sidecar index. In that layout the daemon would
+			// fault against images that were never fetched, so refuse
+			// rather than degrade.
+			if _, err := os.Stat(filepath.Join(checkpointPath, PagesS3IndexFilename)); err == nil {
+				return nil, fmt.Errorf(
+					"STREAM_PRIVATE=uffd needs pages-*.img on local disk, but %s is present, "+
+						"meaning the page data was left in S3; use mmap or copy",
+					PagesS3IndexFilename)
+			} else if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("stat %s: %w", PagesS3IndexFilename, err)
+			}
 			criuOpts.StreamPrivateMode = criurpc.CriuStreamPrivateMode_STREAM_PRIVATE_UFFD.Enum()
 		default:
 			return nil, fmt.Errorf("invalid STREAM_PRIVATE=%q, want \"mmap\", \"copy\" or \"uffd\"", v)
