@@ -7,7 +7,7 @@ PLACEHOLDER_IMG ?= nvcr.io/nvidian/dynamo-dev/dynamo-vllm-placeholder:latest
 # PLACEHOLDER_BASE_IMG must be provided when building placeholder (no default)
 # Optional CRIU source override for snapshot image builds. If unset, the
 # Dockerfile defaults are used.
-CRIU_BUILD_ARGS = $(if $(CRIU_REPO),--build-arg CRIU_REPO=$(CRIU_REPO),) $(if $(CRIU_REF),--build-arg CRIU_REF=$(CRIU_REF),)
+CRIU_BUILD_ARGS = $(if $(CRIU_REPO),--build-arg CRIU_REPO=$(CRIU_REPO),) $(if $(CRIU_REF),--build-arg CRIU_REF=$(CRIU_REF),) $(if $(CRIU_CACHE_BUST),--build-arg CRIU_CACHE_BUST=$(CRIU_CACHE_BUST),)
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -69,6 +69,7 @@ docker-build-agent: ## Build snapshot-agent docker image (linux/amd64 only).
 	$(CONTAINER_TOOL) build --platform ${RUNTIME_IMAGE_PLATFORM} --target agent \
 		$(CRIU_BUILD_ARGS) \
 		--build-context operator=../operator \
+		--build-context compliance=../../container/compliance \
 		-t ${IMG} .
 
 .PHONY: docker-build-placeholder

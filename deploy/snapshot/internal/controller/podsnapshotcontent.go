@@ -45,6 +45,10 @@ type CheckpointParams struct {
 	// ContainerPath is the destination as seen inside the workload container's mount
 	// namespace (equal to HostPath under agentMount storage).
 	ContainerPath string
+	// StorageType is the checkpoint backend ("pvc" or "s3"), resolved from the
+	// source pod's annotations. It routes executor.Checkpoint to the S3 path
+	// (captureCheckpointS3) vs the local-dir path, and gates the post-dump stat.
+	StorageType string
 	// StartedAt marks when the controller observed the work order, for timing.
 	StartedAt time.Time
 }
@@ -251,6 +255,7 @@ func (w *NodeController) runCheckpoint(
 		CheckpointID:  checkpointID,
 		HostPath:      loc.HostPath,
 		ContainerPath: loc.ContainerPath,
+		StorageType:   loc.StorageType,
 		StartedAt:     time.Now(),
 	}
 	if err := w.checkpointFn(leaseCtx, params); err != nil {
@@ -423,29 +428,35 @@ func (w *NodeController) executorCheckpoint(ctx context.Context, params Checkpoi
 	log := logr.FromContextOrDiscard(ctx)
 
 	req := executor.CheckpointRequest{
-		ContainerID:        params.ContainerID,
-		ContainerName:      params.ContainerName,
-		CheckpointID:       params.CheckpointID,
-		CheckpointLocation: params.HostPath,
-		StartedAt:          params.StartedAt,
-		NodeName:           w.config.NodeName,
-		PodName:            params.Pod.Name,
-		PodNamespace:       params.Pod.Namespace,
-		PodIP:              params.Pod.Status.PodIP,
-		Clientset:          w.clientset,
+		ContainerID:           params.ContainerID,
+		ContainerName:         params.ContainerName,
+		CheckpointID:          params.CheckpointID,
+		CheckpointLocation:    params.HostPath,
+		CheckpointStorageType: params.StorageType,
+		StartedAt:             params.StartedAt,
+		NodeName:              w.config.NodeName,
+		PodName:               params.Pod.Name,
+		PodNamespace:          params.Pod.Namespace,
+		PodIP:                 params.Pod.Status.PodIP,
+		Clientset:             w.clientset,
 	}
 	if err := executor.Checkpoint(ctx, w.runtime, log, req, w.config); err != nil {
 		w.killCheckpointProcess(log, params.ContainerPID, "checkpoint failed")
 		return fmt.Errorf("checkpoint: %w", err)
 	}
 
-	info, statErr := os.Stat(params.HostPath)
-	if statErr != nil || !info.IsDir() {
-		w.killCheckpointProcess(log, params.ContainerPID, "checkpoint verification failed")
-		if statErr != nil {
-			return fmt.Errorf("verify checkpoint path %s: %w", params.HostPath, statErr)
+	// S3 checkpoints live in object storage — there is no local directory to
+	// stat (mirrors the restore path's S3 skip). Only verify a real filesystem
+	// artifact for the local (pvc) path.
+	if params.StorageType != snapshotprotocol.StorageTypeS3 {
+		info, statErr := os.Stat(params.HostPath)
+		if statErr != nil || !info.IsDir() {
+			w.killCheckpointProcess(log, params.ContainerPID, "checkpoint verification failed")
+			if statErr != nil {
+				return fmt.Errorf("verify checkpoint path %s: %w", params.HostPath, statErr)
+			}
+			return fmt.Errorf("verify checkpoint path %s: not a directory", params.HostPath)
 		}
-		return fmt.Errorf("verify checkpoint path %s: not a directory", params.HostPath)
 	}
 
 	if err := snapshotruntime.WriteControlSentinel(params.ContainerPID, snapshotprotocol.SnapshotCompleteFile); err != nil {

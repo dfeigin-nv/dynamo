@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -264,7 +265,26 @@ func restoreInNamespaceS3(ctx context.Context, opts RestoreOptions, log logr.Log
 			"restored_cuda_pids", restorePIDs,
 			"criu_callback_pid", restoredPID,
 		)
-		if _, err := cuda.RestoreAndUnlockProcessTree(ctx, restorePIDs, opts.CUDADeviceMap, log); err != nil {
+		if manifest.CUDA.Mode == types.CUDAModeStream {
+			// Custom-storage: VRAM is NOT in the CRIU image — refill it from the
+			// S3 blobs streamed at checkpoint. Rebuild the same GPU URI the
+			// checkpoint side used (<CheckpointLocation>/<Hash>/gpu); these MUST
+			// stay in sync with checkpoint.go's <CheckpointLocation>/gpu.
+			bucket, keyprefix, err := splitS3URI(strings.TrimRight(opts.CheckpointLocation, "/") + "/" + opts.CheckpointHash + "/gpu")
+			if err != nil {
+				return nil, fmt.Errorf("custom-storage GPU restore: %w", err)
+			}
+			// The checkpoint exec inherits the agent env, but this restore path
+			// runs via nsenter without it, so re-export the zero-skip flag from
+			// the manifest onto this single-purpose process env before the exec
+			// (ckpt-stream-restore reads GPU_STREAM_ZERO_SKIP via os.Environ()).
+			if manifest.CUDA.ZeroSkip {
+				os.Setenv("GPU_STREAM_ZERO_SKIP", "1")
+			}
+			if _, err := cuda.StreamRestoreAndUnlockProcessTree(ctx, restorePIDs, bucket, keyprefix, log); err != nil {
+				return nil, fmt.Errorf("CUDA custom-storage restore failed: %w", err)
+			}
+		} else if _, err := cuda.RestoreAndUnlockProcessTree(ctx, restorePIDs, opts.CUDADeviceMap, log); err != nil {
 			return nil, fmt.Errorf("CUDA restore failed: %w", err)
 		}
 		cudaDuration = time.Since(cudaStart)

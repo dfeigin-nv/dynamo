@@ -28,7 +28,7 @@ ARG CRIU_REPO=https://github.com/dfeigin-nv/criu.git
 # + coordinator-parallel restore. No streaming commits. Warm HIT restores in
 # ~4.5s; cold MISS ~13s. Streaming (Pipeline C) stays dormant on the
 # snapshot-s3-memfd-juicefs-streaming branch for later reconciliation.
-ARG CRIU_REF=imageio-on-memfd
+ARG CRIU_REF=memfd-imageio-on-upstream
 
 ARG AGENT_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.11-cuda13.0-devel-ubuntu24.04
 
@@ -156,7 +156,7 @@ ARG CRIU_REF
 # Pass --build-arg CRIU_CACHE_BUST=$(date +%s) to force a fresh git fetch
 # when the upstream branch has new commits but ${CRIU_REF} string is
 # unchanged.
-ARG CRIU_CACHE_BUST=12
+ARG CRIU_CACHE_BUST=14
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
@@ -176,6 +176,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-protobuf \
     libgnutls28-dev \
     libnftables-dev \
+    liblz4-dev \
     uuid-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -301,6 +302,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libprotobuf-c1 \
     libgnutls30t64 \
     libnftables1 \
+    liblz4-1 \
     iproute2 \
     iptables \
     procps \
@@ -404,8 +406,11 @@ RUN chmod +x /usr/local/sbin/criu-stream-fetch
 # can't collide with the base's fragmented NIXL.
 COPY --from=nixl-obj-builder /criu-stream-fetch-cpp /usr/local/sbin/criu-stream-fetch-cpp
 COPY --from=nixl-obj-builder /ckpt-stream /usr/local/sbin/ckpt-stream
+# Custom-storage (GPU_STREAM_S3) checkpoint half — exec'd by the agent Go
+# (cuda.LockAndStreamCheckpointProcessTree) at /usr/local/bin/ckpt-stream-ckpt.
+COPY --from=nixl-obj-builder /ckpt-stream-ckpt /usr/local/bin/ckpt-stream-ckpt
 COPY --from=nixl-obj-builder /usr/local/lib /opt/nixl-runtime/lib
-RUN chmod +x /usr/local/sbin/criu-stream-fetch-cpp /usr/local/sbin/ckpt-stream \
+RUN chmod +x /usr/local/sbin/criu-stream-fetch-cpp /usr/local/sbin/ckpt-stream /usr/local/bin/ckpt-stream-ckpt \
     && printf '%s\n' /opt/nixl-runtime/lib /opt/nixl-runtime/lib/x86_64-linux-gnu \
         > /etc/ld.so.conf.d/nixl-runtime.conf \
     && ldconfig \
@@ -576,6 +581,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libprotobuf-c1 \
     libgnutls30t64 \
     libnftables1 \
+    liblz4-1 \
     iproute2 \
     iptables \
     procps \
@@ -670,6 +676,21 @@ RUN chmod +x /usr/local/bin/nsrestore
 # Copy Pipeline C streamer (spawned by nsrestore when STREAM_MODE=c).
 COPY --from=builder /criu-stream-fetch /usr/local/sbin/criu-stream-fetch
 RUN chmod +x /usr/local/sbin/criu-stream-fetch
+
+# Custom-storage (GPU_STREAM_S3) restore half + its self-consistent NIXL/aws-sdk
+# runtime (mirrors the agent NIXL block). nsrestore execs
+# /usr/local/bin/ckpt-stream-restore from THIS placeholder rootfs (via nsenter)
+# to refill VRAM from S3. The placeholder base has no NIXL, so ship the whole
+# runtime under /opt/nixl-runtime (can't collide with a fragmented base NIXL).
+COPY --from=nixl-obj-builder /ckpt-stream-restore /usr/local/bin/ckpt-stream-restore
+COPY --from=nixl-obj-builder /usr/local/lib /opt/nixl-runtime/lib
+RUN chmod +x /usr/local/bin/ckpt-stream-restore \
+    && printf '%s\n' /opt/nixl-runtime/lib /opt/nixl-runtime/lib/x86_64-linux-gnu \
+        > /etc/ld.so.conf.d/nixl-runtime.conf \
+    && ldconfig \
+    && echo "=== OBJ plugin ===" && find /opt/nixl-runtime -name libplugin_OBJ.so \
+    && ( ldd /usr/local/bin/ckpt-stream-restore | grep -qi "not found" \
+         && echo "WARN: unresolved NIXL libs" || echo "NIXL libs resolved" )
 
 # Create directories
 RUN mkdir -p /checkpoints /var/run/criu /var/criu-work

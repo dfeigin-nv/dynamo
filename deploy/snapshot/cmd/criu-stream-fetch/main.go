@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,6 +46,13 @@ type rangeEntry struct {
 	Source string `json:"source"`
 	Bucket string `json:"bucket,omitempty"`
 	Key    string `json:"key,omitempty"`
+	// Shmid is the CRIU shmem inode id, set only on shmem ranges. It is
+	// the key CRIU restore sends over CRIU_STREAMER_SHMEM_SOCK
+	// (mem.c:recv_streamer_shmem_memfd writes mie->shmid) and the value
+	// the lazy-pages daemon receives in the shmid table
+	// (uffd.c:recv_streamer_daemon_fds) to resolve which VMAs each
+	// eventfd gates.
+	Shmid uint64 `json:"shmid,omitempty"`
 }
 
 type manifest struct {
@@ -87,14 +95,26 @@ func eventfdCreate() (int, error) {
 	return fd, nil
 }
 
-// sendDaemonFds writes the uint32 n_evfd header then a single SCM_RIGHTS
-// message with [abort_fd, ev_0..ev_{n-1}]. Matches the wire protocol in
-// criu/uffd.c:recv_streamer_daemon_fds.
-func sendDaemonFds(sock int, abortFd int, evfds []int) error {
+// sendDaemonFds writes the uint32 n_evfd header, then the n-entry shmid
+// table, then a single SCM_RIGHTS message with [abort_fd, ev_0..ev_{n-1}].
+// Matches the wire protocol in criu/uffd.c:recv_streamer_daemon_fds, which
+// reads the header, then recv()s n*sizeof(uint64) into streamer_evfd_shmids
+// as a raw struct read, then recv_fds(n+1). Native endianness on both sides.
+func sendDaemonFds(sock int, abortFd int, evfds []int, shmids []uint64) error {
+	if len(shmids) != len(evfds) {
+		return fmt.Errorf("shmid table has %d entries, want %d", len(shmids), len(evfds))
+	}
 	var hdr [4]byte
 	binary.NativeEndian.PutUint32(hdr[:], uint32(len(evfds)))
 	if _, err := unix.Write(sock, hdr[:]); err != nil {
 		return fmt.Errorf("write n_evfd: %w", err)
+	}
+	tbl := make([]byte, 8*len(shmids))
+	for i, s := range shmids {
+		binary.NativeEndian.PutUint64(tbl[i*8:], s)
+	}
+	if err := writeAll(sock, tbl); err != nil {
+		return fmt.Errorf("write shmid table: %w", err)
 	}
 	fds := make([]int, 0, 1+len(evfds))
 	fds = append(fds, abortFd)
@@ -104,6 +124,79 @@ func sendDaemonFds(sock int, abortFd int, evfds []int) error {
 		return fmt.Errorf("sendmsg daemon fds: %w", err)
 	}
 	return nil
+}
+
+// writeAll loops over write() until the whole buffer is out. A single
+// unix.Write on a SOCK_STREAM socket may short-write.
+func writeAll(fd int, b []byte) error {
+	for len(b) > 0 {
+		n, err := unix.Write(fd, b)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return err
+		}
+		if n <= 0 {
+			return fmt.Errorf("write returned %d", n)
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
+// readAll loops over read() until n bytes are drained. Returns io.EOF if the
+// peer closes mid-message.
+func readAll(fd int, b []byte) error {
+	for len(b) > 0 {
+		n, err := unix.Read(fd, b)
+		if err != nil {
+			if err == unix.EINTR {
+				continue
+			}
+			return err
+		}
+		if n == 0 {
+			return io.EOF
+		}
+		b = b[n:]
+	}
+	return nil
+}
+
+// serveShmemSocket answers CRIU restore's shmem-memfd requests. CRIU writes
+// an 8-byte shmid (mem.c:recv_streamer_shmem_memfd) and expects a single
+// SCM_RIGHTS reply carrying that shmem range's memfd. There is no ack: the
+// streamer fills asynchronously and the daemon gates visibility via the
+// per-range eventfd, so this must reply immediately even while the fill for
+// that range is still in flight.
+//
+// Runs until CRIU closes the socket. Every restored task shares one socket
+// endpoint and serializes on streamer_shmem_sock_lock, so requests arrive
+// one at a time.
+func serveShmemSocket(sock int, byShmid map[uint64]int) {
+	for {
+		var buf [8]byte
+		if err := readAll(sock, buf[:]); err != nil {
+			if err != io.EOF {
+				fmt.Fprintf(os.Stderr, "criu-stream-fetch: shmem sock read: %v\n", err)
+			}
+			return
+		}
+		shmid := binary.NativeEndian.Uint64(buf[:])
+		memfd, ok := byShmid[shmid]
+		if !ok {
+			// Replying with nothing would wedge CRIU in recv_fds. Log
+			// loudly and close so the restore fails fast instead.
+			fmt.Fprintf(os.Stderr,
+				"criu-stream-fetch: no shmem range for shmid=%d (%#x)\n", shmid, shmid)
+			return
+		}
+		if err := sendPrivateFd(sock, memfd); err != nil {
+			fmt.Fprintf(os.Stderr, "criu-stream-fetch: send shmem memfd %d: %v\n", shmid, err)
+			return
+		}
+	}
 }
 
 // sendPrivateFd sends pages_memfd over the per-task private-pages
@@ -273,6 +366,7 @@ func main() {
 	// (CRIU lazy-pages with --stream-restore). Private-only dumps
 	// (e.g. a single sleep process) skip the daemon entirely.
 	daemonSock, _ := socketFromEnv("CRIU_STREAMER_DAEMON_SOCK")
+	shmemSock, _ := socketFromEnv("CRIU_STREAMER_SHMEM_SOCK")
 	privateSock, err := socketFromEnv("CRIU_STREAMER_PRIVATE_SOCK")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
@@ -294,7 +388,15 @@ func main() {
 	// Allocate one memfd + one eventfd per shmem range.
 	shmemMemfds := make([]int, len(m.ShmemRanges))
 	shmemEvfds := make([]int, len(m.ShmemRanges))
+	shmemShmids := make([]uint64, len(m.ShmemRanges))
+	shmemByShmid := make(map[uint64]int, len(m.ShmemRanges))
 	for i, r := range m.ShmemRanges {
+		if r.Shmid == 0 {
+			fmt.Fprintf(os.Stderr,
+				"criu-stream-fetch: shmem range %d has no shmid; manifest is stale\n", r.ID)
+			poisonAbort(abortFd)
+			os.Exit(1)
+		}
 		mfd, err := memfdCreate(fmt.Sprintf("criu-shmem-%d", r.ID), r.Size)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
@@ -309,17 +411,74 @@ func main() {
 		}
 		shmemMemfds[i] = mfd
 		shmemEvfds[i] = evfd
+		shmemShmids[i] = r.Shmid
+		shmemByShmid[r.Shmid] = mfd
 	}
 
 	// Send abort_fd + eventfds to the daemon side via SCM_RIGHTS.
 	// Skip entirely if no shmem ranges + no daemon socket inherited:
-	// private-only dumps don't run a lazy-pages daemon.
+	// private-only dumps don't run a lazy-pages daemon. The agent only
+	// spawns one when the manifest has shmem ranges, so a daemon socket
+	// with an empty range list would be an agent bug — CRIU rejects
+	// n_evfd == 0 as bogus, and the daemon would hang the restore.
 	if daemonSock >= 0 && len(shmemEvfds) > 0 {
-		if err := sendDaemonFds(daemonSock, abortFd, shmemEvfds); err != nil {
+		if err := sendDaemonFds(daemonSock, abortFd, shmemEvfds, shmemShmids); err != nil {
 			fmt.Fprintf(os.Stderr, "criu-stream-fetch: %v\n", err)
 			poisonAbort(abortFd)
 			os.Exit(1)
 		}
+	} else if daemonSock >= 0 {
+		fmt.Fprintln(os.Stderr,
+			"criu-stream-fetch: daemon socket inherited but manifest has no shmem ranges")
+		poisonAbort(abortFd)
+		os.Exit(1)
+	}
+
+	// Serve CRIU restore's shmem-memfd requests concurrently with the
+	// fills below: CRIU asks for the inode during open_shmem, long before
+	// the bytes land, and gates visibility on the per-range eventfd.
+	if shmemSock >= 0 && len(shmemMemfds) > 0 {
+		go serveShmemSocket(shmemSock, shmemByShmid)
+	}
+
+	// Fill the shmem memfds in parallel, signalling each eventfd as its
+	// range completes so the daemon can start answering CONTINUE faults
+	// for that shmid without waiting for the rest.
+	shmemFilled := make(chan struct{})
+	if len(m.ShmemRanges) > 0 {
+		go func() {
+			defer close(shmemFilled)
+			var wg sync.WaitGroup
+			sem := make(chan struct{}, shmemFillConcurrency())
+			for i := range m.ShmemRanges {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
+					r := &m.ShmemRanges[i]
+					start := time.Now()
+					if err := fillMemfd(shmemMemfds[i], r.Source); err != nil {
+						fmt.Fprintf(os.Stderr,
+							"criu-stream-fetch: fill shmem shmid=%d: %v\n", r.Shmid, err)
+						poisonAbort(abortFd)
+						return
+					}
+					if err := signalReady(shmemEvfds[i]); err != nil {
+						fmt.Fprintf(os.Stderr,
+							"criu-stream-fetch: signal shmid=%d: %v\n", r.Shmid, err)
+						poisonAbort(abortFd)
+						return
+					}
+					fmt.Fprintf(os.Stderr, "[stream] shmem shmid=%d %d bytes in %s\n",
+						r.Shmid, r.Size, time.Since(start))
+				}(i)
+			}
+			wg.Wait()
+			fmt.Fprintf(os.Stderr, "[stream] shmem fill done (%d ranges)\n", len(m.ShmemRanges))
+		}()
+	} else {
+		close(shmemFilled)
 	}
 
 	// Private-VMA path: request-response over the private socket.
@@ -413,22 +572,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[stream] private loop done\n")
 	}
 
-	// Fill each shmem memfd, signal its eventfd as the last byte lands.
-	// Sequential for the smoke; per-range goroutines once NIXL is wired.
-	for i, r := range m.ShmemRanges {
-		if err := fillMemfd(shmemMemfds[i], r.Source); err != nil {
-			fmt.Fprintf(os.Stderr, "criu-stream-fetch: fill shmem %d: %v\n", r.ID, err)
-			poisonAbort(abortFd)
-			os.Exit(1)
-		}
-		if err := signalReady(shmemEvfds[i]); err != nil {
-			fmt.Fprintf(os.Stderr, "criu-stream-fetch: signal %d: %v\n", r.ID, err)
-			poisonAbort(abortFd)
-			os.Exit(1)
-		}
-		unix.Close(shmemMemfds[i])
-		unix.Close(shmemEvfds[i])
-	}
+	// Shmem fills were launched before the private loop so they overlap
+	// CRIU's setup. Wait for them here. The memfds stay open until exit:
+	// serveShmemSocket hands them to CRIU on demand, and CRIU may ask for
+	// any shmid at any point during restore.
+	<-shmemFilled
 
 	// Stay alive until the peer closes whichever socket we're using.
 	// Private-only dumps watch privateSock; shmem dumps watch daemonSock.
@@ -444,4 +592,18 @@ func main() {
 		}
 	}
 	unix.Close(abortFd)
+}
+
+// shmemFillConcurrency bounds how many shmem ranges are filled at once.
+// The gpt-oss-120b dump has 423 ranges totalling ~124 GiB; unbounded
+// goroutines would thrash the page cache and the PVC. Override with
+// SHMEM_FILL_CONCURRENCY.
+func shmemFillConcurrency() int {
+	if v := os.Getenv("SHMEM_FILL_CONCURRENCY"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 16
 }

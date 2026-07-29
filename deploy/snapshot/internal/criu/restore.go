@@ -1,13 +1,18 @@
 package criu
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	criulib "github.com/checkpoint-restore/go-criu/v8"
 	criurpc "github.com/checkpoint-restore/go-criu/v8/rpc"
@@ -49,8 +54,21 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 		Source string `json:"source"`
 		Bucket string `json:"bucket,omitempty"`
 		Key    string `json:"key,omitempty"`
+		Shmid  uint64 `json:"shmid,omitempty"`
 	}
 	var priv []rangeEntry
+	var shmem []rangeEntry
+
+	// Split shmem pages images out of the private set. Every
+	// pagemap-shmem-<shmid>.img names one shmem inode and points at one
+	// pages-<pages_id>.img; those bytes are served over the shmem socket
+	// and demand-paged with UFFDIO_CONTINUE, not handed to a task as a
+	// private memfd. Without this split a pages file would be claimed by
+	// both paths.
+	shmidByPagesID, err := scanShmemPagemaps(checkpointPath)
+	if err != nil {
+		return "", err
+	}
 
 	idxPath := filepath.Join(checkpointPath, PagesS3IndexFilename)
 	if idxBytes, err := os.ReadFile(idxPath); err == nil {
@@ -60,13 +78,19 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 		}
 		for _, p := range idx.Pages {
 			src := fmt.Sprintf("s3://%s/%s", idx.Bucket, p.Key)
-			priv = append(priv, rangeEntry{
+			e := rangeEntry{
 				ID:     p.ID,
 				Size:   p.Size,
 				Source: src,
 				Bucket: idx.Bucket,
 				Key:    p.Key,
-			})
+			}
+			if shmid, ok := shmidByPagesID[p.ID]; ok {
+				e.Shmid = shmid
+				shmem = append(shmem, e)
+				continue
+			}
+			priv = append(priv, e)
 		}
 	} else if !os.IsNotExist(err) {
 		return "", fmt.Errorf("read %s: %w", idxPath, err)
@@ -90,7 +114,13 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 			if err != nil {
 				return "", fmt.Errorf("stat %s: %w", src, err)
 			}
-			priv = append(priv, rangeEntry{ID: id, Size: uint64(info.Size()), Source: src})
+			e := rangeEntry{ID: id, Size: uint64(info.Size()), Source: src}
+			if shmid, ok := shmidByPagesID[id]; ok {
+				e.Shmid = shmid
+				shmem = append(shmem, e)
+				continue
+			}
+			priv = append(priv, e)
 		}
 	}
 
@@ -101,65 +131,260 @@ func writePipelineCManifest(checkpointPath, workDir string) (string, error) {
 		return "", err
 	}
 	out := filepath.Join(workDir, "pipeline-c-manifest.json")
-	body := []byte(`{"shmem_ranges":[],"private_ranges":[`)
-	first := true
-	for _, r := range priv {
-		if !first {
-			body = append(body, ',')
-		}
-		first = false
-		if r.Bucket != "" {
-			body = append(body, []byte(fmt.Sprintf(
-				`{"id":%d,"size":%d,"source":%q,"bucket":%q,"key":%q}`,
-				r.ID, r.Size, r.Source, r.Bucket, r.Key))...)
-		} else {
-			body = append(body, []byte(fmt.Sprintf(
-				`{"id":%d,"size":%d,"source":%q}`, r.ID, r.Size, r.Source))...)
-		}
+	if priv == nil {
+		priv = []rangeEntry{}
 	}
-	body = append(body, []byte("]}")...)
+	if shmem == nil {
+		shmem = []rangeEntry{}
+	}
+	body, err := json.Marshal(struct {
+		ShmemRanges   []rangeEntry `json:"shmem_ranges"`
+		PrivateRanges []rangeEntry `json:"private_ranges"`
+	}{shmem, priv})
+	if err != nil {
+		return "", fmt.Errorf("marshal manifest: %w", err)
+	}
 	if err := os.WriteFile(out, body, 0o644); err != nil {
 		return "", err
 	}
 	return out, nil
 }
 
-// spawnPipelineCStreamer forks the criu-stream-fetch binary with one end
-// of a Unix SOCK_STREAM socketpair attached as inherited fd 3, and
-// returns the swrk-side end for go-criu to pass to the spawned CRIU.
+// scanShmemPagemaps maps pages-<pages_id>.img -> shmem inode shmid by
+// reading every pagemap-shmem-<shmid>.img header in checkpointPath.
 //
-// Streamer fd 3 (its private socket end) is non-CLOEXEC so it survives
-// exec; the swrk end has CLOEXEC stripped only on the way into criu
-// (handled by go-criu's ExtraFiles plumbing).
-func spawnPipelineCStreamer(manifest string, log logr.Logger) (*exec.Cmd, *os.File, error) {
-	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+// CRIU image layout: 4-byte IMG_COMMON_MAGIC, 4-byte per-type magic, then
+// length-prefixed protobuf entries. The first entry of a pagemap image is a
+// PagemapHead whose only field is `pages_id` (field 1, varint), so the
+// header can be read without pulling in protobuf codegen.
+func scanShmemPagemaps(checkpointPath string) (map[uint32]uint64, error) {
+	entries, err := os.ReadDir(checkpointPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("socketpair: %w", err)
+		return nil, fmt.Errorf("readdir %s: %w", checkpointPath, err)
 	}
-	streamerEnd := os.NewFile(uintptr(pair[0]), "stream-priv-streamer")
-	swrkEnd := os.NewFile(uintptr(pair[1]), "stream-priv-swrk")
+	out := make(map[uint32]uint64)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "pagemap-shmem-") || !strings.HasSuffix(name, ".img") {
+			continue
+		}
+		idStr := strings.TrimSuffix(strings.TrimPrefix(name, "pagemap-shmem-"), ".img")
+		shmid, err := strconv.ParseUint(idStr, 10, 64)
+		if err != nil {
+			continue
+		}
+		pagesID, err := readPagemapPagesID(filepath.Join(checkpointPath, name))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		if prev, dup := out[pagesID]; dup {
+			return nil, fmt.Errorf(
+				"pages-%d.img claimed by both shmid %d and %d", pagesID, prev, shmid)
+		}
+		out[pagesID] = shmid
+	}
+	return out, nil
+}
 
+// readPagemapPagesID returns the pages_id from a pagemap image header.
+func readPagemapPagesID(path string) (uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	// 8 bytes of magic + 4-byte little-endian length of the first entry.
+	var hdr [12]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return 0, fmt.Errorf("read header: %w", err)
+	}
+	n := binary.LittleEndian.Uint32(hdr[8:12])
+	if n == 0 || n > 64 {
+		return 0, fmt.Errorf("implausible PagemapHead length %d", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return 0, fmt.Errorf("read PagemapHead: %w", err)
+	}
+	// Field 1, wire type 0 (varint) => tag byte 0x08.
+	if buf[0] != 0x08 {
+		return 0, fmt.Errorf("PagemapHead first field tag is %#x, want 0x08", buf[0])
+	}
+	v, consumed := binary.Uvarint(buf[1:])
+	if consumed <= 0 {
+		return 0, fmt.Errorf("malformed pages_id varint")
+	}
+	if v > math.MaxUint32 {
+		return 0, fmt.Errorf("pages_id %d overflows uint32", v)
+	}
+	return uint32(v), nil
+}
+
+// streamerSocks holds the CRIU-side ends of the streamer socketpairs.
+// privateSwrk and shmemSwrk go to criu swrk via go-criu; daemonEnd goes to
+// the lazy-pages daemon. shmemSwrk and daemonEnd are nil for a dump with no
+// shmem ranges.
+type streamerSocks struct {
+	privateSwrk *os.File
+	shmemSwrk   *os.File
+	daemonEnd   *os.File
+}
+
+func (s *streamerSocks) close() {
+	for _, f := range []*os.File{s.privateSwrk, s.shmemSwrk, s.daemonEnd} {
+		if f != nil {
+			f.Close()
+		}
+	}
+}
+
+// spawnPipelineCStreamer forks the criu-stream-fetch binary with the
+// streamer-side ends of up to three Unix SOCK_STREAM socketpairs attached as
+// inherited fds 3..5, and returns the peer ends.
+//
+//	fd 3  CRIU_STREAMER_PRIVATE_SOCK  per-task private-VMA memfds  -> criu swrk
+//	fd 4  CRIU_STREAMER_DAEMON_SOCK   abort_fd + shmid table + evfds -> lazy-pages
+//	fd 5  CRIU_STREAMER_SHMEM_SOCK    shmid -> shmem memfd          -> criu swrk
+//
+// The daemon/shmem pair is only created when the manifest has shmem ranges:
+// CRIU rejects an n_evfd of 0, and a daemon that never completes its handshake
+// would hang the restore.
+//
+// Streamer fds are non-CLOEXEC so they survive exec; the swrk ends have
+// CLOEXEC stripped only on the way into criu (go-criu's ExtraFiles plumbing).
+func spawnPipelineCStreamer(manifest string, withShmem bool, log logr.Logger) (*exec.Cmd, *streamerSocks, error) {
 	const streamerBin = "/usr/local/sbin/criu-stream-fetch"
 	if _, err := os.Stat(streamerBin); err != nil {
-		streamerEnd.Close()
-		swrkEnd.Close()
 		return nil, nil, fmt.Errorf("streamer binary missing: %w", err)
 	}
 
+	socks := &streamerSocks{}
+	var streamerEnds []*os.File
+	closeAll := func() {
+		socks.close()
+		for _, f := range streamerEnds {
+			f.Close()
+		}
+	}
+
+	mkpair := func(name string) (*os.File, *os.File, error) {
+		pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if err != nil {
+			return nil, nil, fmt.Errorf("socketpair(%s): %w", name, err)
+		}
+		return os.NewFile(uintptr(pair[0]), name+"-streamer"),
+			os.NewFile(uintptr(pair[1]), name+"-peer"), nil
+	}
+
+	privStreamer, privPeer, err := mkpair("stream-priv")
+	if err != nil {
+		return nil, nil, err
+	}
+	streamerEnds = append(streamerEnds, privStreamer)
+	socks.privateSwrk = privPeer
+
+	env := append(os.Environ(), "CRIU_STREAMER_PRIVATE_SOCK=3")
+	if withShmem {
+		daemonStreamer, daemonPeer, err := mkpair("stream-daemon")
+		if err != nil {
+			closeAll()
+			return nil, nil, err
+		}
+		streamerEnds = append(streamerEnds, daemonStreamer)
+		socks.daemonEnd = daemonPeer
+
+		shmemStreamer, shmemPeer, err := mkpair("stream-shmem")
+		if err != nil {
+			closeAll()
+			return nil, nil, err
+		}
+		streamerEnds = append(streamerEnds, shmemStreamer)
+		socks.shmemSwrk = shmemPeer
+
+		env = append(env,
+			"CRIU_STREAMER_DAEMON_SOCK=4",
+			"CRIU_STREAMER_SHMEM_SOCK=5")
+	}
+
 	cmd := exec.Command(streamerBin, "--manifest", manifest)
-	cmd.Env = append(os.Environ(), "CRIU_STREAMER_PRIVATE_SOCK=3")
-	cmd.ExtraFiles = []*os.File{streamerEnd}
+	cmd.Env = env
+	cmd.ExtraFiles = streamerEnds
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		streamerEnd.Close()
-		swrkEnd.Close()
+		closeAll()
 		return nil, nil, fmt.Errorf("start streamer: %w", err)
 	}
-	streamerEnd.Close() // parent's copy; child has the inherited fd 3
+	for _, f := range streamerEnds {
+		f.Close() // parent's copies; the child holds the inherited fds
+	}
 	log.Info("Pipeline C streamer started",
-		"pid", cmd.Process.Pid, "manifest", manifest)
-	return cmd, swrkEnd, nil
+		"pid", cmd.Process.Pid, "manifest", manifest, "shmem", withShmem)
+	return cmd, socks, nil
+}
+
+// spawnLazyPagesDaemon starts `criu lazy-pages --stream-restore` so shmem
+// VMAs are served by UFFDIO_CONTINUE instead of inline reads.
+//
+// Ordering matters. cr_lazy_pages() creates and listens on
+// <workDir>/lazy-pages.socket before it blocks in recv_streamer_daemon_fds(),
+// so the restore's connect lands in the listen backlog even while the daemon
+// is still waiting on the streamer handshake. But the socket has to exist
+// before criu restore calls prepare_lazy_pages_socket(), otherwise the
+// connect fails and CRIU degrades to serving shmem inline with only a warning
+// (uffd.c "no lazy-pages daemon"). So this must be called, and the socket
+// observed, before the Restore RPC.
+//
+// This runs inside the placeholder namespaces already (same as the streamer),
+// so workDir resolves to the same file the restoring CRIU will connect to.
+func spawnLazyPagesDaemon(imagesDir, workDir string, daemonSock *os.File, log logr.Logger) (*exec.Cmd, error) {
+	const criuBin = "/usr/local/sbin/criu"
+	if _, err := os.Stat(criuBin); err != nil {
+		return nil, fmt.Errorf("criu binary missing: %w", err)
+	}
+
+	sockPath := filepath.Join(workDir, "lazy-pages.socket")
+	_ = os.Remove(sockPath) // a stale socket makes connect() succeed against nothing
+
+	cmd := exec.Command(criuBin, "lazy-pages",
+		"--stream-restore",
+		"-D", imagesDir,
+		"-W", workDir,
+		"-o", "lazy-pages.log",
+		"-v4",
+	)
+	// The daemon reads its streamer socket from CRIU_STREAMER_DAEMON_SOCK,
+	// which names an fd number in its own process (uffd.c:recv_streamer_daemon_fds).
+	cmd.Env = append(os.Environ(), "CRIU_STREAMER_DAEMON_SOCK=3")
+	cmd.ExtraFiles = []*os.File{daemonSock}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start lazy-pages: %w", err)
+	}
+
+	// Wait for the listening socket to appear so the restore's connect
+	// cannot lose the race. The daemon may still be blocked in the streamer
+	// handshake at this point; that is fine, the backlog holds the connect.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(sockPath); err == nil {
+			break
+		}
+		if cmd.ProcessState != nil {
+			return nil, fmt.Errorf("lazy-pages daemon exited before creating %s", sockPath)
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			return nil, fmt.Errorf("timed out waiting for %s", sockPath)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	log.Info("CRIU lazy-pages daemon started",
+		"pid", cmd.Process.Pid, "socket", sockPath, "images", imagesDir)
+	return cmd, nil
 }
 
 // RestoreLogFilename is the CRIU restore log filename (also used by executor/restore.go).
@@ -268,12 +493,17 @@ func ExecuteRestore(
 	// end to go-criu. Setup runs inside the placeholder namespace so
 	// cross-ns fd passing is unnecessary.
 	var streamer *exec.Cmd
+	var lazyPages *exec.Cmd
 	if criuOpts.GetStreamRestore() {
 		manifest, err := writePipelineCManifest(checkpointPath, settings.WorkDir)
 		if err != nil {
 			return 0, nil, fmt.Errorf("Pipeline C manifest: %w", err)
 		}
-		s, sockSwrk, err := spawnPipelineCStreamer(manifest, log)
+		nShmem, err := manifestShmemCount(manifest)
+		if err != nil {
+			return 0, nil, fmt.Errorf("Pipeline C manifest: %w", err)
+		}
+		s, socks, err := spawnPipelineCStreamer(manifest, nShmem > 0, log)
 		if err != nil {
 			return 0, nil, fmt.Errorf("Pipeline C streamer spawn: %w", err)
 		}
@@ -284,8 +514,31 @@ func ExecuteRestore(
 				_, _ = streamer.Process.Wait()
 			}
 		}()
-		c.SetStreamPrivateSock(sockSwrk)
-		defer sockSwrk.Close()
+		defer socks.close()
+
+		c.SetStreamPrivateSock(socks.privateSwrk)
+		if socks.shmemSwrk != nil {
+			c.SetStreamShmemSock(socks.shmemSwrk)
+		}
+
+		// Shmem VMAs are served by UFFDIO_CONTINUE from the lazy-pages
+		// daemon. Without it CRIU falls back to inline reads and only
+		// warns, so a restore can look healthy while the whole CONTINUE
+		// path is dead — start it explicitly and fail loudly.
+		if socks.daemonEnd != nil {
+			lp, err := spawnLazyPagesDaemon(checkpointPath, settings.WorkDir, socks.daemonEnd, log)
+			if err != nil {
+				return 0, nil, fmt.Errorf("Pipeline C lazy-pages spawn: %w", err)
+			}
+			lazyPages = lp
+			defer func() {
+				if lazyPages != nil && lazyPages.ProcessState == nil {
+					_ = lazyPages.Process.Signal(syscall.SIGTERM)
+					_, _ = lazyPages.Process.Wait()
+				}
+			}()
+		}
+		log.Info("Pipeline C wired", "shmem_ranges", nShmem, "lazy_pages", socks.daemonEnd != nil)
 	}
 
 	cleanupCache := ApplyMemfdCache(c, criuOpts, memfdCacheFD, memfdCacheID, log)
@@ -473,4 +726,21 @@ func (n *restoreNotify) PostRestore(pid int32) error {
 	n.restoredPID = pid
 	n.log.Info("CRIU post-restore: process restored", "pid", pid)
 	return nil
+}
+
+// manifestShmemCount reports how many shmem ranges the manifest carries.
+// Drives whether the daemon/shmem sockets and the lazy-pages daemon are set
+// up at all.
+func manifestShmemCount(path string) (int, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	var m struct {
+		ShmemRanges []struct{} `json:"shmem_ranges"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return 0, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return len(m.ShmemRanges), nil
 }

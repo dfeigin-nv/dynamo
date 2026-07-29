@@ -51,7 +51,9 @@ int main(int argc, char **argv) {
     }
 
     // Phase 3: per-pid DtoH -> NIXL_WRITE -> OperationComplete.
-    uint64_t total = 0;
+    bool zeroSkip = zeroSkipEnabled();
+    std::fprintf(stderr, "[ckpt-ckpt] zero-skip %s\n", zeroSkip ? "ON" : "off");
+    uint64_t total = 0, packedTotal = 0;
     double dtoh_s = 0, up_s = 0;
     for (size_t pi = 0; pi < pids.size(); pi++) {
         CsInfo *csi = csis[pi];
@@ -68,19 +70,59 @@ int main(int argc, char **argv) {
             double b = now_s(); dtoh_s += b - a;
 
             std::string key = devKey(pidPrefix, i);
-            if (!nixlWriteWhole(agent.get(), &hint, host, d->size, i, key)) return 1;
-            double c = now_s(); up_s += c - b;
             total += d->size;
-            std::fprintf(stderr, "[ckpt-ckpt] pid %d dev%u %.0f MiB: DtoH %.2fs, WRITE->s3://%s/%s %.2fs\n",
-                         pids[pi], i, d->size / 1048576.0, b - a, bucket.c_str(), key.c_str(), c - b);
+
+            if (!zeroSkip) {
+                if (!nixlWriteWhole(agent.get(), &hint, host, d->size, i, key)) return 1;
+                double c = now_s(); up_s += c - b;
+                packedTotal += d->size;
+                std::fprintf(stderr, "[ckpt-ckpt] pid %d dev%u %.0f MiB: DtoH %.2fs, WRITE->s3://%s/%s %.2fs\n",
+                             pids[pi], i, d->size / 1048576.0, b - a, bucket.c_str(), key.c_str(), c - b);
+                cuMemFreeHost(host);
+                continue;
+            }
+
+            // Zero-skip: scan non-zero extents, pack, write dev<i>.bin + dev<i>.idx.
+            std::vector<ZsExtent> ext;
+            if (!scanExtents(host, d->size, ext)) {          // too fragmented -> whole blob
+                ext.clear(); ZsExtent w{}; w.logicalOff = 0; w.length = d->size; ext.push_back(w);
+                std::fprintf(stderr, "[ckpt-ckpt] pid %d dev%u zero-skip overflow -> whole blob\n", pids[pi], i);
+            }
+            uint64_t packedSize = 0;
+            for (auto &e : ext) { e.packedOff = packedSize; packedSize += e.length; }
+
+            void *packed = nullptr;
+            if (packedSize) {
+                CK(cuMemHostAlloc(&packed, packedSize, CU_MEMHOSTALLOC_PORTABLE));
+                for (auto &e : ext)
+                    std::memcpy((uint8_t *)packed + e.packedOff, (uint8_t *)host + e.logicalOff, e.length);
+            }
             cuMemFreeHost(host);
+
+            // Fixed-size index object.
+            std::vector<uint8_t> idx(ZS_IDX_BYTES, 0);
+            ZsHeader *h = reinterpret_cast<ZsHeader *>(idx.data());
+            h->magic = ZS_MAGIC; h->version = ZS_VERSION; h->extentCount = (uint32_t)ext.size();
+            h->logicalSize = d->size; h->packedSize = packedSize;
+            std::memcpy(idx.data() + sizeof(ZsHeader), ext.data(), ext.size() * sizeof(ZsExtent));
+
+            if (packedSize && !nixlWriteWhole(agent.get(), &hint, packed, packedSize, i, key)) return 1;
+            std::string ikey = idxKey(pidPrefix, i);
+            if (!nixlWriteWhole(agent.get(), &hint, idx.data(), ZS_IDX_BYTES, i, ikey)) return 1;
+            double c = now_s(); up_s += c - b;
+            packedTotal += packedSize;
+            if (packed) cuMemFreeHost(packed);
+            std::fprintf(stderr, "[ckpt-ckpt] pid %d dev%u %.0f MiB: DtoH %.2fs, packed %.0f MiB (%zu ext, %.1f%%), WRITE %.2fs\n",
+                         pids[pi], i, d->size / 1048576.0, b - a, packedSize / 1048576.0, ext.size(),
+                         100.0 * packedSize / (d->size ? d->size : 1), c - b);
         }
         CK(cuCheckpointOperationComplete(csi->handle));
         std::fprintf(stderr, "[ckpt-ckpt] pid %d OperationComplete (VRAM freed, still LOCKED)\n", pids[pi]);
     }
 
-    std::fprintf(stderr, "[ckpt-ckpt] STAGED %.0f MiB  DtoH=%.2fs (%.2f GiB/s)  upload=%.2fs (%.2f GiB/s)  no-file; EXIT WITHOUT UNLOCK\n",
-                 total / 1048576.0, dtoh_s, total / 1073741824.0 / (dtoh_s > 0 ? dtoh_s : 1),
-                 up_s, total / 1073741824.0 / (up_s > 0 ? up_s : 1));
+    std::fprintf(stderr, "[ckpt-ckpt] STAGED %.0f MiB (packed %.0f MiB, %.1f%%)  DtoH=%.2fs (%.2f GiB/s)  upload=%.2fs (%.2f GiB/s)  no-file; EXIT WITHOUT UNLOCK\n",
+                 total / 1048576.0, packedTotal / 1048576.0, 100.0 * packedTotal / (total ? total : 1),
+                 dtoh_s, total / 1073741824.0 / (dtoh_s > 0 ? dtoh_s : 1),
+                 up_s, packedTotal / 1073741824.0 / (up_s > 0 ? up_s : 1));
     return 0;
 }

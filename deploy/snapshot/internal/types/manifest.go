@@ -156,7 +156,25 @@ func NewOverlayManifest(exclusions OverlaySettings, upperDir string, ociSpec *sp
 type CUDAManifest struct {
 	PIDs           []int    `yaml:"pids"`
 	SourceGPUUUIDs []string `yaml:"sourceGpuUuids"`
+	// Mode selects the GPU checkpoint/restore path. Empty ("") = toggle
+	// (cuda-checkpoint-helper, VRAM lands in the CRIU image). "stream" =
+	// custom-storage: VRAM was streamed GPU->host->NIXL->S3 out-of-band and
+	// MUST be refilled from S3 on restore (it is NOT in the CRIU image). Restore
+	// selects on this field alone — it is intrinsic to how the checkpoint was
+	// captured, so restore obeys the manifest, not its own env.
+	Mode string `yaml:"mode,omitempty"`
+	// GPUKeyPrefix is the S3 key (bucket-relative) under which the streamed GPU
+	// blobs live (<keyprefix>/p<i>/dev<j>.bin). Only set when Mode == "stream".
+	GPUKeyPrefix string `yaml:"gpuKeyPrefix,omitempty"`
+	// ZeroSkip records whether userspace zero-skip (GPU_STREAM_ZERO_SKIP=1) was
+	// on at checkpoint time. The checkpoint exec inherits the agent env, but the
+	// restore exec runs via nsenter and does NOT, so restore re-exports the flag
+	// from the manifest. Only meaningful when Mode == "stream".
+	ZeroSkip bool `yaml:"zeroSkip,omitempty"`
 }
+
+// CUDAModeStream is the CUDAManifest.Mode value for custom-storage (VRAM streamed to S3).
+const CUDAModeStream = "stream"
 
 func NewCUDAManifest(pids []int, sourceGPUUUIDs []string) CUDAManifest {
 	return CUDAManifest{

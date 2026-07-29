@@ -344,19 +344,46 @@ func captureCheckpointS3(
 ) (*checkpointPhaseTimings, error) {
 	timings := &checkpointPhaseTimings{}
 
+	streamGPU := gpuStreamS3Enabled()
+
 	// CUDA lock+checkpoint must happen before CRIU dump.
+	var gpuKeyPrefix string
 	if len(state.CUDAHostPIDs) > 0 {
-		cudaTimings, err := cuda.LockAndCheckpointProcessTree(ctx, state.CUDAHostPIDs, log)
-		if err != nil {
-			return nil, fmt.Errorf("CUDA checkpoint failed: %w", err)
+		if streamGPU {
+			// Custom-storage: stream VRAM GPU->host->NIXL->S3 out-of-band. GPU
+			// blobs land at <CheckpointLocation>/gpu/p<i>/dev<j>.bin, sibling to
+			// the img-* shards. This URI must match what restore rebuilds.
+			bucket, keyprefix, err := splitS3URI(strings.TrimRight(req.CheckpointLocation, "/") + "/gpu")
+			if err != nil {
+				return nil, fmt.Errorf("custom-storage GPU checkpoint: %w", err)
+			}
+			gpuKeyPrefix = keyprefix
+			cudaTimings, err := cuda.LockAndStreamCheckpointProcessTree(ctx, state.CUDAHostPIDs, bucket, keyprefix, log)
+			if err != nil {
+				return nil, fmt.Errorf("CUDA custom-storage checkpoint failed: %w", err)
+			}
+			timings.CUDADuration = cudaTimings.TotalDuration
+		} else {
+			cudaTimings, err := cuda.LockAndCheckpointProcessTree(ctx, state.CUDAHostPIDs, log)
+			if err != nil {
+				return nil, fmt.Errorf("CUDA checkpoint failed: %w", err)
+			}
+			timings.CUDADuration = cudaTimings.TotalDuration
 		}
-		timings.CUDADuration = cudaTimings.TotalDuration
 	}
 
 	// Build CRIU opts + manifest without writing them to a local checkpoint dir.
 	criuOpts, manifest, err := configureCheckpointNoDir(log, state, req, cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	// Record custom-storage mode so restore refills VRAM from S3 rather than
+	// expecting it in the (VRAM-free) CRIU image.
+	if streamGPU && !manifest.CUDA.IsEmpty() {
+		manifest.CUDA.Mode = types.CUDAModeStream
+		manifest.CUDA.GPUKeyPrefix = gpuKeyPrefix
+		manifest.CUDA.ZeroSkip = os.Getenv("GPU_STREAM_ZERO_SKIP") == "1"
 	}
 
 	// req.CheckpointLocation includes the per-checkpoint suffix
@@ -441,4 +468,28 @@ func splitS3Location(location, checkpointID string) (string, string, error) {
 		return "", "", fmt.Errorf("S3 checkpoint location %q has empty trailing segment", location)
 	}
 	return prefix, hash, nil
+}
+
+// splitS3URI splits an s3://bucket/key URI into (bucket, key). The NIXL OBJ
+// backend used by ckpt-stream-{ckpt,restore} takes the bucket as a separate arg
+// and a bucket-relative key, so the s3:// URI must be decomposed.
+func splitS3URI(uri string) (string, string, error) {
+	const scheme = "s3://"
+	if !strings.HasPrefix(uri, scheme) {
+		return "", "", fmt.Errorf("S3 URI %q must begin with s3://", uri)
+	}
+	rest := uri[len(scheme):]
+	idx := strings.Index(rest, "/")
+	if idx <= 0 || idx >= len(rest)-1 {
+		return "", "", fmt.Errorf("S3 URI %q must be of the form s3://bucket/key", uri)
+	}
+	return rest[:idx], rest[idx+1:], nil
+}
+
+// gpuStreamS3Enabled reports whether custom-storage (VRAM->S3) GPU checkpoint is
+// on. Env-gated (GPU_STREAM_S3=1), mirroring the S3_DIRECT idiom; Helm wires the
+// env in Phase F. Default off => existing deployments take the toggle path
+// unchanged. Only meaningful with S3 storage (custom-storage requires S3).
+func gpuStreamS3Enabled() bool {
+	return os.Getenv("GPU_STREAM_S3") == "1"
 }

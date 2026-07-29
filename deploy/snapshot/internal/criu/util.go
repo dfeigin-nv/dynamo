@@ -67,6 +67,17 @@ func applyCommonSettings(opts *criurpc.CriuOpts, settings *types.CRIUSettings) e
 		return fmt.Errorf("invalid image I/O mode: %w", err)
 	}
 	opts.ImageIoMode = ioMode.Enum()
+
+	// Memory-page compression (PR #2895, fork RPC tags 76+). Off by default:
+	// leave opts.Compress nil when disabled so the wire stays byte-identical
+	// for existing deployments. On dump this makes CRIU store nothing for
+	// all-zero pages (the checkpoint staging phantom collapses to holes).
+	if settings.Compress > 0 {
+		opts.Compress = proto.Uint32(settings.Compress)
+		if settings.CompressAcceleration > 0 {
+			opts.CompressAcceleration = proto.Uint32(settings.CompressAcceleration)
+		}
+	}
 	return nil
 }
 

@@ -17,6 +17,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <dlfcn.h>
 
 #include "nixl.h"
@@ -58,6 +59,7 @@ static CUresult (*cuMemHostAlloc)(void **, size_t, unsigned);
 static CUresult (*cuMemFreeHost)(void *);
 static CUresult (*cuMemcpyDtoHAsync_v2)(void *, CUdeviceptr, size_t, CUstream);
 static CUresult (*cuMemcpyHtoDAsync_v2)(CUdeviceptr, const void *, size_t, CUstream);
+static CUresult (*cuMemsetD8_v2)(CUdeviceptr, unsigned char, size_t);
 static CUresult (*cuStreamSynchronize)(CUstream);
 
 #define CK(call) do { CUresult _r = (call); if (_r != 0) { \
@@ -73,7 +75,8 @@ static void load_cuda() {
     SYM(cuCtxSetCurrent); SYM(cuStreamGetCtx); SYM(cuCheckpointProcessGetState);
     SYM(cuCheckpointProcessLock); SYM(cuCheckpointProcessCheckpoint); SYM(cuCheckpointProcessRestore);
     SYM(cuCheckpointProcessUnlock); SYM(cuCheckpointOperationComplete); SYM(cuMemHostAlloc);
-    SYM(cuMemFreeHost); SYM(cuMemcpyDtoHAsync_v2); SYM(cuMemcpyHtoDAsync_v2); SYM(cuStreamSynchronize);
+    SYM(cuMemFreeHost); SYM(cuMemcpyDtoHAsync_v2); SYM(cuMemcpyHtoDAsync_v2);
+    SYM(cuMemsetD8_v2); SYM(cuStreamSynchronize);
 #undef SYM
 }
 
@@ -172,4 +175,75 @@ static bool nixlReadWhole(nixlAgent *agent, nixl_opt_args_t *hint, void *host, s
 // (<keyprefix>/dev<i>.bin); Phase 1 moves it under <hash>/gpu/.
 static std::string devKey(const std::string &keyprefix, unsigned i) {
     return keyprefix + "/dev" + std::to_string(i) + ".bin";
+}
+
+// ---- Zero-skip (Phase E): pack only non-zero extents + a fixed-size index ----
+//
+// vLLM pre-allocates the whole --gpu-memory-utilization VRAM pool; at checkpoint
+// most of it is empty KV cache (zeros). Scanning the DtoH'd host buffer and
+// writing only non-zero extents shrinks dev<i>.bin from the full pool (~38 GiB)
+// to ~weights+live-KV. Gated by GPU_STREAM_ZERO_SKIP=1 (both binaries); off ->
+// whole-blob path is byte-unchanged.
+//
+// dev<i>.idx = fixed ZS_IDX_BYTES so restore reads it with a compile-time size
+// (no object-size query). dev<i>.bin = the packed non-zero bytes (packedSize,
+// from the idx header). Overflow past ZS_MAX_EXTENTS -> one whole-blob extent.
+
+static const uint32_t ZS_MAGIC = 0x585047; // "GPX"
+static const uint32_t ZS_VERSION = 1;
+static const size_t   ZS_MAX_EXTENTS = 4096;
+static const size_t   ZS_PAGE = 4096;              // extent alignment
+static const size_t   ZS_MIN_GAP = 2u << 20;       // coalesce zero gaps < 2 MiB
+
+typedef struct { uint32_t magic, version, extentCount, pad; uint64_t logicalSize, packedSize; } ZsHeader;
+typedef struct { uint64_t logicalOff, packedOff, length; } ZsExtent;
+
+static const size_t ZS_IDX_BYTES = sizeof(ZsHeader) + ZS_MAX_EXTENTS * sizeof(ZsExtent);
+
+static bool zeroSkipEnabled() {
+    const char *v = std::getenv("GPU_STREAM_ZERO_SKIP");
+    return v && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+}
+
+static std::string idxKey(const std::string &keyprefix, unsigned i) {
+    return keyprefix + "/dev" + std::to_string(i) + ".idx";
+}
+
+// True if the page-sized chunk [p, p+n) is entirely zero.
+static bool chunkIsZero(const uint8_t *p, size_t n) {
+    size_t w = n / 8;
+    const uint64_t *q = reinterpret_cast<const uint64_t *>(p);
+    for (size_t i = 0; i < w; i++) if (q[i]) return false;
+    for (size_t i = w * 8; i < n; i++) if (p[i]) return false;
+    return true;
+}
+
+// Scan `host[0..len)` for non-zero extents (ZS_PAGE granularity), coalescing
+// runs separated by < ZS_MIN_GAP zeros. Fills logicalOff/length (packedOff set
+// by the caller). Returns false if it would exceed ZS_MAX_EXTENTS (caller falls
+// back to a single whole-blob extent).
+static bool scanExtents(const void *host, size_t len, std::vector<ZsExtent> &out) {
+    out.clear();
+    const uint8_t *base = static_cast<const uint8_t *>(host);
+    size_t off = 0;
+    while (off < len) {
+        size_t chunk = std::min(ZS_PAGE, len - off);
+        if (chunkIsZero(base + off, chunk)) { off += chunk; continue; }
+        size_t start = off;
+        size_t gap = 0, lastNonZeroEnd = off + chunk;
+        off += chunk;
+        while (off < len) {                          // extend, tolerating small gaps
+            size_t c = std::min(ZS_PAGE, len - off);
+            if (chunkIsZero(base + off, c)) {
+                gap += c;
+                if (gap >= ZS_MIN_GAP) break;
+            } else { gap = 0; lastNonZeroEnd = off + c; }
+            off += c;
+        }
+        ZsExtent e{}; e.logicalOff = start; e.length = lastNonZeroEnd - start;
+        out.push_back(e);
+        if (out.size() > ZS_MAX_EXTENTS) return false;
+        off = lastNonZeroEnd;
+    }
+    return true;
 }

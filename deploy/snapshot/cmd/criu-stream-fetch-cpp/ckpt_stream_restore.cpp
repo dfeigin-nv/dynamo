@@ -34,7 +34,9 @@ int main(int argc, char **argv) {
     if (!setupNixl(bucket, throughput, agent, backend)) return 1;
     nixl_opt_args_t hint; hint.backends.push_back(backend);
 
-    uint64_t total = 0;
+    bool zeroSkip = zeroSkipEnabled();
+    std::fprintf(stderr, "[ckpt-restore] zero-skip %s\n", zeroSkip ? "ON" : "off");
+    uint64_t total = 0, packedTotal = 0;
     double dl_s = 0, htod_s = 0;
 
     // Phase 1: restore + refill + OperationComplete each pid.
@@ -52,22 +54,58 @@ int main(int argc, char **argv) {
         for (unsigned i = 0; i < rsi->deviceCount; i++) {
             PerDev *d = &rsi->perDeviceData[i];
             CUcontext dctx; CK(cuStreamGetCtx(d->stream, &dctx)); CK(cuCtxSetCurrent(dctx));
-            void *host = nullptr;
-            CK(cuMemHostAlloc(&host, d->size, CU_MEMHOSTALLOC_PORTABLE));
-
             std::string key = devKey(pidPrefix, i);
+            total += d->size;
+
+            if (!zeroSkip) {
+                void *host = nullptr;
+                CK(cuMemHostAlloc(&host, d->size, CU_MEMHOSTALLOC_PORTABLE));
+                double a = now_s();
+                if (!nixlReadWhole(agent.get(), &hint, host, d->size, i, key)) return 1;
+                double b = now_s(); dl_s += b - a;
+                CK(cuMemcpyHtoDAsync_v2(d->devPtr, host, d->size, d->stream));
+                CK(cuStreamSynchronize(d->stream));
+                double c = now_s(); htod_s += c - b;
+                packedTotal += d->size;
+                std::fprintf(stderr, "[ckpt-restore] pid %d dev%u %.0f MiB: READ<-s3://%s/%s %.2fs (%.2f GiB/s), HtoD %.2fs\n",
+                             pid, i, d->size / 1048576.0, bucket.c_str(), key.c_str(), b - a,
+                             d->size / 1073741824.0 / (b - a > 0 ? b - a : 1), c - b);
+                cuMemFreeHost(host);
+                continue;
+            }
+
+            // Zero-skip: read idx, zero the device region, read packed, scatter HtoD.
+            std::vector<uint8_t> idx(ZS_IDX_BYTES, 0);
+            std::string ikey = idxKey(pidPrefix, i);
             double a = now_s();
-            if (!nixlReadWhole(agent.get(), &hint, host, d->size, i, key)) return 1;
+            if (!nixlReadWhole(agent.get(), &hint, idx.data(), ZS_IDX_BYTES, i, ikey)) return 1;
+            ZsHeader *h = reinterpret_cast<ZsHeader *>(idx.data());
+            if (h->magic != ZS_MAGIC || h->version != ZS_VERSION || h->logicalSize != d->size) {
+                std::fprintf(stderr, "FATAL: bad idx dev%u magic=%x ver=%u logical=%llu (dev size %zu)\n",
+                             i, h->magic, h->version, (unsigned long long)h->logicalSize, d->size);
+                return 1;
+            }
+            const ZsExtent *ex = reinterpret_cast<const ZsExtent *>(idx.data() + sizeof(ZsHeader));
+            uint32_t nExt = h->extentCount; uint64_t packedSize = h->packedSize;
+
+            CK(cuMemsetD8_v2(d->devPtr, 0, d->size));         // holes stay zero
+            void *packed = nullptr;
+            if (packedSize) {
+                CK(cuMemHostAlloc(&packed, packedSize, CU_MEMHOSTALLOC_PORTABLE));
+                if (!nixlReadWhole(agent.get(), &hint, packed, packedSize, i, key)) return 1;
+            }
             double b = now_s(); dl_s += b - a;
 
-            CK(cuMemcpyHtoDAsync_v2(d->devPtr, host, d->size, d->stream));
+            for (uint32_t e = 0; e < nExt; e++)
+                CK(cuMemcpyHtoDAsync_v2(d->devPtr + ex[e].logicalOff,
+                                        (uint8_t *)packed + ex[e].packedOff, ex[e].length, d->stream));
             CK(cuStreamSynchronize(d->stream));
             double c = now_s(); htod_s += c - b;
-            total += d->size;
-            std::fprintf(stderr, "[ckpt-restore] pid %d dev%u %.0f MiB: READ<-s3://%s/%s %.2fs (%.2f GiB/s), HtoD %.2fs\n",
-                         pid, i, d->size / 1048576.0, bucket.c_str(), key.c_str(), b - a,
-                         d->size / 1073741824.0 / (b - a > 0 ? b - a : 1), c - b);
-            cuMemFreeHost(host);
+            packedTotal += packedSize;
+            if (packed) cuMemFreeHost(packed);
+            std::fprintf(stderr, "[ckpt-restore] pid %d dev%u %.0f MiB (packed %.0f MiB, %u ext): READ %.2fs (%.2f GiB/s), HtoD %.2fs\n",
+                         pid, i, d->size / 1048576.0, packedSize / 1048576.0, nExt, b - a,
+                         packedSize / 1073741824.0 / (b - a > 0 ? b - a : 1), c - b);
         }
         CK(cuCheckpointOperationComplete(rsi->handle));
         std::fprintf(stderr, "[ckpt-restore] pid %d OperationComplete (VRAM refilled)\n", pid);
@@ -81,7 +119,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "[ckpt-restore] pid %d unlocked, state=%d (expect 0/running)\n", pid, st);
     }
 
-    std::fprintf(stderr, "[ckpt-restore] RESTORED %.0f MiB  download=%.2fs (%.2f GiB/s)  HtoD=%.2fs  round-trip OK\n",
-                 total / 1048576.0, dl_s, total / 1073741824.0 / (dl_s > 0 ? dl_s : 1), htod_s);
+    std::fprintf(stderr, "[ckpt-restore] RESTORED %.0f MiB (packed %.0f MiB, %.1f%%)  download=%.2fs (%.2f GiB/s)  HtoD=%.2fs  round-trip OK\n",
+                 total / 1048576.0, packedTotal / 1048576.0, 100.0 * packedTotal / (total ? total : 1),
+                 dl_s, packedTotal / 1073741824.0 / (dl_s > 0 ? dl_s : 1), htod_s);
     return 0;
 }

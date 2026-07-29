@@ -341,6 +341,32 @@ func LockAndCheckpointProcessTree(ctx context.Context, cudaPIDs []int, log logr.
 	return timings, nil
 }
 
+// LockAndStreamCheckpointProcessTree is the custom-storage (stream-to-S3) analog
+// of LockAndCheckpointProcessTree: it runs ckpt-stream-ckpt, which locks+checkpoints
+// the whole tree and streams VRAM GPU->host->NIXL->S3 (blobs under
+// <keyprefix>/p<i>/dev<j>.bin), leaving every pid locked + CHECKPOINTED with VRAM
+// freed so CRIU can dump a (GPU-free) process. bucket/keyprefix are the split S3
+// target; they MUST match what StreamRestoreAndUnlockProcessTree rebuilds on restore.
+func LockAndStreamCheckpointProcessTree(ctx context.Context, cudaPIDs []int, bucket, keyprefix string, log logr.Logger) (CheckpointPhaseTimings, error) {
+	var timings CheckpointPhaseTimings
+	start := time.Now()
+	err := runStream(ctx, ckptStreamCkptBinary, cudaPIDs, bucket, keyprefix, log)
+	timings.TotalDuration = time.Since(start)
+	return timings, err
+}
+
+// StreamRestoreAndUnlockProcessTree is the custom-storage analog of
+// RestoreAndUnlockProcessTree: it runs ckpt-stream-restore, which restores each
+// still-CHECKPOINTED pid, refills VRAM from the S3 blobs (NIXL_READ -> HtoD), then
+// unlocks the tree. bucket/keyprefix MUST match the checkpoint-side layout.
+func StreamRestoreAndUnlockProcessTree(ctx context.Context, cudaPIDs []int, bucket, keyprefix string, log logr.Logger) (RestorePhaseTimings, error) {
+	var timings RestorePhaseTimings
+	start := time.Now()
+	err := runStream(ctx, ckptStreamRestoreBinary, cudaPIDs, bucket, keyprefix, log)
+	timings.TotalDuration = time.Since(start)
+	return timings, err
+}
+
 // RestoreAndUnlockProcessTree restores and unlocks CUDA state for the given PIDs.
 func RestoreAndUnlockProcessTree(ctx context.Context, cudaPIDs []int, deviceMap string, log logr.Logger) (RestorePhaseTimings, error) {
 	var timings RestorePhaseTimings

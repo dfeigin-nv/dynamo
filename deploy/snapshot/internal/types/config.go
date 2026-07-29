@@ -126,6 +126,14 @@ func (c *AgentConfig) Validate() error {
 			Message: fmt.Sprintf("unsupported imageIoMode %q; expected %q, %q, or empty", c.CRIU.ImageIoMode, "writeback", "direct"),
 		}
 	}
+	switch c.CRIU.Compress {
+	case 0, 1, 2:
+	default:
+		return &ConfigError{
+			Field:   "criu.compress",
+			Message: fmt.Sprintf("unsupported compress %d; expected 0 (off), 1 (per-page), or 2 (region)", c.CRIU.Compress),
+		}
+	}
 	return c.Restore.Validate()
 }
 
@@ -180,6 +188,12 @@ type CRIUSettings struct {
 	ExtMasters        bool   `yaml:"extMasters"`
 	ManageCgroupsMode string `yaml:"manageCgroupsMode"`
 	ImageIoMode       string `yaml:"imageIoMode"`
+	// Compress selects CRIU memory-page compression (PR #2895): 0 = off,
+	// 1 = per-page, 2 = region. Off by default. When on, CRIU content-detects
+	// all-zero pages and stores nothing for them, collapsing the checkpoint
+	// staging phantom on the dump path.
+	Compress             uint32 `yaml:"compress"`
+	CompressAcceleration uint32 `yaml:"compressAcceleration"`
 	RstSibling        bool   `yaml:"rstSibling"`
 	MntnsCompatMode   bool   `yaml:"mntnsCompatMode"`
 	EvasiveDevices    bool   `yaml:"evasiveDevices"`
@@ -188,6 +202,7 @@ type CRIUSettings struct {
 	LibDir            string `yaml:"libDir"`
 	AllowUprobes      bool   `yaml:"allowUprobes"`
 	SkipInFlight      bool   `yaml:"skipInFlight"`
+	MemfdPrivateAnon  bool   `yaml:"memfdPrivateAnon"`
 }
 
 // OverlaySettings is the static config for rootfs exclusions.

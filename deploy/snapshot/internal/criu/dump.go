@@ -218,5 +218,8 @@ func buildCRIUConf(c *types.CRIUSettings) string {
 	if c.SkipInFlight {
 		content += "skip-in-flight\n"
 	}
+	if c.MemfdPrivateAnon {
+		content += "memfd-private-anon\n"
+	}
 	return content
 }
