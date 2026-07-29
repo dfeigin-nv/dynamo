@@ -476,6 +476,17 @@ func main() {
 					defer func() { <-sem }()
 					r := &m.ShmemRanges[i]
 					start := time.Now()
+					if skipShmemFill() {
+						// Experiment knob: leave the memfd zero-filled but
+						// still signal ready, to measure whether anything in
+						// the restored workload ever reads shmem content.
+						// Wrong data if it does — inference correctness is
+						// the check. Never set this in production.
+						if err := signalReady(shmemEvfds[i]); err != nil {
+							poisonAbort(abortFd)
+						}
+						return
+					}
 					if err := fillMemfd(shmemMemfds[i], r.Source); err != nil {
 						fmt.Fprintf(os.Stderr,
 							"criu-stream-fetch: fill shmem shmid=%d: %v\n", r.Shmid, err)
@@ -624,4 +635,10 @@ func shmemFillConcurrency() int {
 		}
 	}
 	return 16
+}
+
+// skipShmemFill gates the SHMEM_SKIP_FILL experiment described at its only
+// call site.
+func skipShmemFill() bool {
+	return os.Getenv("SHMEM_SKIP_FILL") == "1"
 }
