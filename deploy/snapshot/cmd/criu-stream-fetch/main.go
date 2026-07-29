@@ -252,14 +252,15 @@ func fillMemfd(memfd int, source string) error {
 		return err
 	}
 	defer src.Close()
-	// Wrap the fd in *os.File for io.Copy; do NOT defer dst.Close() —
-	// the caller continues to use memfd by raw fd. We seek to 0 and
-	// io.Copy advances via Write which uses the memfd's offset; that's
-	// fine for sequential fill, but if the caller does later writes
-	// they must seek themselves.
-	dst := os.NewFile(uintptr(memfd), "memfd")
-	_, err = io.Copy(dst, src)
-	return err
+	// Write with raw pwrite rather than wrapping memfd in an *os.File.
+	// os.NewFile takes ownership of the descriptor, so once the wrapper
+	// becomes unreachable the runtime finalizer close()s it — which used
+	// to be harmless because the caller closed the memfd immediately
+	// after filling, but now the shmem memfds have to stay open for
+	// serveShmemSocket to hand them to CRIU on demand. Losing them that
+	// way shows up as an EBADF on send and then a hung restore:
+	//   criu-stream-fetch: send shmem memfd <shmid>: sendmsg: bad file descriptor
+	return copyReaderToFdAt(memfd, 0, src)
 }
 
 // copyFileToFdAt writes source's bytes into memfd starting at offset
