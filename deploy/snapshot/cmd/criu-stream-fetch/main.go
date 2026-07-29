@@ -119,9 +119,26 @@ func sendDaemonFds(sock int, abortFd int, evfds []int, shmids []uint64) error {
 	fds := make([]int, 0, 1+len(evfds))
 	fds = append(fds, abortFd)
 	fds = append(fds, evfds...)
-	rights := unix.UnixRights(fds...)
-	if err := unix.Sendmsg(sock, []byte{0}, rights, nil, 0); err != nil {
-		return fmt.Errorf("sendmsg daemon fds: %w", err)
+	return sendFdsChunked(sock, fds)
+}
+
+// crScmMaxFD mirrors CR_SCM_MAX_FD in include/common/scm.h. The kernel caps
+// one SCM_RIGHTS message at SCM_MAX_FD (253) descriptors, and CRIU's
+// __recv_fds loops in chunks of 252 with a one-byte iov per chunk. A single
+// sendmsg carrying all 424 fds of a gpt-oss-120b dump fails with EINVAL, so
+// the sender has to chunk identically or the handshake never lands.
+const crScmMaxFD = 252
+
+func sendFdsChunked(sock int, fds []int) error {
+	for i := 0; i < len(fds); i += crScmMaxFD {
+		n := len(fds) - i
+		if n > crScmMaxFD {
+			n = crScmMaxFD
+		}
+		rights := unix.UnixRights(fds[i : i+n]...)
+		if err := unix.Sendmsg(sock, []byte{0}, rights, nil, 0); err != nil {
+			return fmt.Errorf("sendmsg fds [%d,%d): %w", i, i+n, err)
+		}
 	}
 	return nil
 }
